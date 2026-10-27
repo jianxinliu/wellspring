@@ -9,7 +9,7 @@ export const HTTP_PORT = Number(process.env.WELLSPRING_HTTP_PORT ?? 7777);
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const READ_OPS = new Set(["ping", "list", "describe", "view", "policy_get", "audit", "auth_check"]);
-const WRITE_OPS = new Set(["put", "delete", "policy_put", "resolve", "draw_env", "draw", "auth_issue_oneshot",
+const WRITE_OPS = new Set(["put", "put_source", "adopt", "delete", "policy_put", "resolve", "draw_env", "draw", "auth_issue_oneshot",
   // Derived operations need the admin token too: a signature oracle is still an oracle.
   "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt"]);
 
@@ -295,7 +295,9 @@ function drawVault() {
         (i === 0 ? '<td rowspan="' + e.fields.length + '"><span class="badge ' + cls + '">' + esc(e.id) + "</span></td>" : "") +
         "<td>" + esc(f.name) + "</td><td>" + esc(f.class ?? "credential") + "</td>" +
         '<td class="mono">' + esc(f.fingerprint ?? "") + "</td>" +
-        '<td class="mono">' + esc(e.maskedPreview?.[f.name] ?? "****") + "</td>" +
+        '<td class="mono">' + (f.source
+          ? '<span class="badge" title="每次取用时从宿主机现读，本工具不保存它的值">' + esc(f.source) + "</span>"
+          : esc(e.maskedPreview?.[f.name] ?? "****")) + "</td>" +
         "<td>" + expiryBadge(f) + "</td>" +
         (i === 0 ? '<td rowspan="' + e.fields.length + '">' + (e.tags ?? []).map(esc).join(", ") + "</td>" : "") +
         '<td><button class="usage-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '" aria-expanded="false">使用</button> <button class="edit-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">轮换</button> <button class="danger delete-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">删除字段</button>' + (i === 0 ? ' <button class="danger delete-entry" data-entry="' + S.entries.indexOf(e) + '">删除条目</button>' : '') + '</td></tr>'
@@ -388,7 +390,9 @@ function showAdd(index, fieldIndex) {
       : '<div class="card" id="add-form"><h2>新增凭据</h2><p class="hint">填个名字、粘贴值，保存。</p>' +
         '<div class="row" id="quick-kinds"></div>' +
         '<div class="kv"><b>名称</b><input id="f-id" placeholder="例如 github_token" autocapitalize="off" autocorrect="off">' +
-        '<b>值</b><input id="f-val" type="password" placeholder="密钥、密码或私钥" autocomplete="new-password"></div>' +
+        '<b>值</b><input id="f-val" type="password" placeholder="密钥、密码或私钥" autocomplete="new-password">' +
+        '<b>或来源</b><input id="f-src" placeholder="env:NAME 或 dotenv:/绝对路径#KEY" autocapitalize="off" autocorrect="off" spellcheck="false">' +
+        '<b></b><span class="hint" style="margin:0">填了来源就不存值，每次取用时现读。可选 env:NAME、dotenv:/路径#KEY、file:/路径、keychain:服务名、command:命令。</span></div>' +
         '<div id="f-adv-wrap"><button id="f-adv-toggle" type="button" style="margin-top:12px">高级选项</button>' +
         '<div id="f-adv" class="kv" style="display:none;margin-top:12px">' +
         '<b>字段名</b><input id="f-field" placeholder="默认 value">' +
@@ -462,7 +466,9 @@ async function addPut() {
   const editing = form.dataset.edit === '1';
   const entry = editing ? S.entries[Number(form.dataset.entry)] : undefined;
   const value = document.getElementById("f-val").value;
-  if (!value) { notify('请填写要保存的值', true); return; }
+  const source = (document.getElementById("f-src").value || '').trim();
+  if (!value && !source) { notify('填一个值，或者填一个来源', true); return; }
+  if (value && source) { notify('值和来源只能选一个', true); return; }
   const body = {
     // A bare name is prefixed so nobody has to learn the ref syntax up front.
     id: editing ? entry.id : normalizeId(document.getElementById("f-id").value, document.getElementById('f-cls').value),
@@ -480,9 +486,14 @@ async function addPut() {
   if (ttl === 'keep') body.expiresAt = Number(ttlSelect.dataset.expiresAt);
   else if (ttl) body.ttlMs = Number(ttl);
   if (!body.mask) { notify('请明确选择脱敏方式后保存', true); return; }
-  const r = await api("put", body);
+  // A source-backed field stores no ciphertext, so it takes the other write path:
+  // put() would demand a value, and there is none to give.
+  const r = source && !editing
+    ? await api("put_source", { ...body, source, value: undefined })
+    : await api("put", body);
   if (r.ok) {
     if (editing) notify('已轮换并加密保存');
+    else if (source) notify('已绑定来源 ' + source + '，不存值');
     else notify('已保存 ' + body.id + (body.ttlMs ? '（' + fmtDuration(body.ttlMs) + '）' : ''));
     form.remove(); renderVault();
   }

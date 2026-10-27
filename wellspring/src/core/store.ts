@@ -6,6 +6,7 @@
 import { gcm } from "@noble/ciphers/aes";
 import { randomBytes, scryptSync } from "node:crypto";
 import { obtainPassphrase, SEALED_KEY_ERROR } from "./custody.ts";
+import { parseSource, readSource, sourceLabel, type Source } from "./source.ts";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, chmodSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -104,11 +105,19 @@ export type Class = "credential" | "pii" | "pii_high";
 export type Recipe = { id: string; channel: string; template: unknown };
 
 export type Field = {
-  value: string; // encrypted b64 (or plaintext if store not sealed yet — never, we seal on write)
+  /** Encrypted b64. Absent when the field is an external reference and stores nothing. */
+  value?: string;
+  /** External origin, read at draw time. Mutually exclusive with `value`. */
+  source?: Source;
   class: Class;
   mask?: string; // for pii: keep1 | phone | region | none
   expiresAt?: number; // epoch ms; after this instant the daemon refuses to draw the value
 };
+
+/** True when the field holds no ciphertext because the value lives elsewhere. */
+export function isExternal(f: Field): boolean {
+  return f.source !== undefined;
+}
 
 export type Entry = {
   id: string; // e.g. cred:db_prod / person:zhang_san
@@ -182,6 +191,29 @@ function resolveExpiry(opts?: { ttlMs?: number; expiresAt?: number }): number | 
   return undefined; // no expiry supplied: the credential becomes permanent again
 }
 
+/** Resolve a field's current plaintext, whether stored locally or read from a source. */
+function valueOf(f: Field): string {
+  if (f.source) return readSource(f.source);
+  if (f.value === undefined) throw new Error("corrupt field: neither ciphertext nor source");
+  return Buffer.from(decrypt(getMasterKey(), f.value)).toString("utf8");
+}
+
+/**
+ * A source-backed field stores no ciphertext, so there is nothing to compute a
+ * fingerprint from without reading it. The fingerprint therefore describes the
+ * source itself: swapping the origin changes it, rotating the value does not.
+ */
+function descriptorFingerprint(f: Field): string {
+  if (f.source) return fingerprint(`source:${f.source.kind}:${f.source.ref}:${f.source.field ?? ""}`);
+  return fingerprint(Buffer.from(decrypt(getMasterKey(), f.value!)).toString("utf8"));
+}
+
+/**
+ * Mask preview for a source-backed field. Reading an external source here would
+ * turn "look at the list" into a draw, so the preview is deliberately blank.
+ */
+const EXTERNAL_PREVIEW = "（外部来源，未读取）";
+
 export function putSecret(id: string, field: string, plaintext: string, opts?: { cls?: Class; mask?: string; tags?: string[]; ttlMs?: number; expiresAt?: number }) {
   validateKey(id, "id");
   validateKey(field, "field");
@@ -196,12 +228,11 @@ export function putSecret(id: string, field: string, plaintext: string, opts?: {
     throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
   }
   const expiresAt = resolveExpiry(opts);
-  const key = getMasterKey();
   const s = loadStore();
   if (!hasOwn(s.entries, id)) s.entries[id] = { id, type: id.startsWith("person:") ? "person" : "credential", fields: Object.create(null) };
   const cls = opts?.cls ?? (id.startsWith("person:") ? "pii" : "credential");
   const stored: Field = {
-    value: encrypt(key, Buffer.from(plaintext, "utf8")),
+    value: encrypt(getMasterKey(), Buffer.from(plaintext, "utf8")),
     class: cls,
     mask: opts?.mask,
   };
@@ -209,6 +240,50 @@ export function putSecret(id: string, field: string, plaintext: string, opts?: {
   if (expiresAt !== undefined) stored.expiresAt = expiresAt;
   s.entries[id].fields[field] = stored;
   if (opts?.tags) s.entries[id].tags = opts.tags;
+  saveStore(s);
+}
+
+/**
+ * Bind a field to an external source. Nothing is copied: the ciphertext slot is
+ * cleared so the store cannot hold a stale copy of a secret it no longer owns.
+ */
+export function putSource(id: string, field: string, spec: unknown, opts?: { cls?: Class; mask?: string; tags?: string[]; ttlMs?: number; expiresAt?: number }) {
+  validateKey(id, "id");
+  validateKey(field, "field");
+  const source = parseSource(spec);
+  if (opts !== undefined && (opts === null || typeof opts !== "object" || Array.isArray(opts))) throw new Error("invalid options");
+  if (opts?.cls !== undefined && !["credential", "pii", "pii_high"].includes(opts.cls)) throw new Error("invalid class");
+  if (opts?.mask !== undefined && !["keep1", "phone", "region", "none"].includes(opts.mask)) throw new Error("invalid mask");
+  if (opts?.tags !== undefined && (!Array.isArray(opts.tags) || opts.tags.length > 100 ||
+    Array.from(opts.tags).some((tag) => typeof tag !== "string" || !tag.trim() || tag.length > 128 || /[\u0000-\u001f\u007f]/u.test(tag)))) {
+    throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
+  }
+  const expiresAt = resolveExpiry(opts);
+  // Fail fast: a reference that cannot be read on day one is almost always a
+  // typo in a path or variable name, and finding that out at draw time is worse.
+  readSource(source);
+  const s = loadStore();
+  if (!hasOwn(s.entries, id)) s.entries[id] = { id, type: id.startsWith("person:") ? "person" : "credential", fields: Object.create(null) };
+  const cls = opts?.cls ?? s.entries[id].fields[field]?.class ?? (id.startsWith("person:") ? "pii" : "credential");
+  const stored: Field = { source, class: cls, mask: opts?.mask ?? s.entries[id].fields[field]?.mask };
+  if (expiresAt !== undefined) stored.expiresAt = expiresAt;
+  s.entries[id].fields[field] = stored;
+  if (opts?.tags) s.entries[id].tags = opts.tags;
+  saveStore(s);
+}
+
+/** Detach a field from its external source and store a local encrypted copy. */
+export function adoptSource(id: string, field: string): void {
+  validateKey(id, "id");
+  validateKey(field, "field");
+  const s = loadStore();
+  const f = hasOwn(s.entries, id) && hasOwn(s.entries[id].fields, field) ? s.entries[id].fields[field] : undefined;
+  if (!f) throw new Error(`no such secret: ${id}/${field}`);
+  if (!f.source) throw new Error(`not an external reference: ${id}/${field}`);
+  const plaintext = readSource(f.source);
+  const stored: Field = { value: encrypt(getMasterKey(), Buffer.from(plaintext, "utf8")), class: f.class, mask: f.mask };
+  if (f.expiresAt !== undefined) stored.expiresAt = f.expiresAt;
+  s.entries[id].fields[field] = stored;
   saveStore(s);
 }
 
@@ -231,12 +306,11 @@ export function deleteSecret(id: string, field?: string): void {
 export function getSecret(id: string, field: string): string {
   validateKey(id, "id");
   validateKey(field, "field");
-  const key = getMasterKey();
   const s = loadStore();
   const entry = hasOwn(s.entries, id) ? s.entries[id] : undefined;
   const f = entry && hasOwn(entry.fields, field) ? entry.fields[field] : undefined;
   if (!f) throw new Error(`no such secret: ${id}/${field}`);
-  return Buffer.from(decrypt(key, f.value)).toString("utf8");
+  return valueOf(f);
 }
 
 /**
@@ -246,13 +320,14 @@ export function getSecret(id: string, field: string): string {
 export function getSecretFresh(id: string, field: string): string {
   validateKey(id, "id");
   validateKey(field, "field");
-  const key = getMasterKey();
   const s = loadStore();
   const entry = hasOwn(s.entries, id) ? s.entries[id] : undefined;
   const f = entry && hasOwn(entry.fields, field) ? entry.fields[field] : undefined;
   if (!f) throw new Error(`no such secret: ${id}/${field}`);
+  // Expiry is checked before a source is contacted: a refused draw must not
+  // spill the existence of the underlying file or variable.
   if (f.expiresAt !== undefined && Date.now() >= f.expiresAt) throw new Error(`secret expired: ${id}/${field}`);
-  return Buffer.from(decrypt(key, f.value)).toString("utf8");
+  return valueOf(f);
 }
 
 export function mask(plaintext: string, mode?: string): string {
@@ -276,7 +351,7 @@ export function mask(plaintext: string, mode?: string): string {
 /** Descriptor: everything an agent is allowed to see. Never contains plaintext. */
 export type Descriptor = {
   ref: string;
-  fields: { name: string; class: Class; mask?: string; fingerprint: string; expiresAt?: number; expired?: boolean }[];
+  fields: { name: string; class: Class; mask?: string; fingerprint: string; source?: string; expiresAt?: number; expired?: boolean }[];
   recipes: { id: string; channel: string }[];
   tags: string[];
 };
@@ -299,7 +374,6 @@ function availableRecipes(entry: Entry): Descriptor['recipes'] {
 }
 export function listDescriptors(filter?: { tag?: string }): Descriptor[] {
   const s = loadStore();
-  const key = getMasterKey();
   return Object.values(s.entries)
     .filter((e) => !filter?.tag || (e.tags ?? []).includes(filter.tag))
     .map((e) => ({
@@ -308,7 +382,8 @@ export function listDescriptors(filter?: { tag?: string }): Descriptor[] {
         name,
         class: f.class,
         mask: f.mask,
-        fingerprint: fingerprint(Buffer.from(decrypt(key, f.value)).toString("utf8")),
+        fingerprint: descriptorFingerprint(f),
+        ...(f.source ? { source: sourceLabel(f.source) } : {}),
         ...expiryProjection(f),
       })),
       recipes: availableRecipes(e),
@@ -319,13 +394,18 @@ export function listDescriptors(filter?: { tag?: string }): Descriptor[] {
 export function describe(id: string): Descriptor & { maskedPreview: Record<string, string> } {
   validateKey(id, "id");
   const s = loadStore();
-  const key = getMasterKey();
   const e = hasOwn(s.entries, id) ? s.entries[id] : undefined;
   if (!e) throw new Error(`no such entry: ${id}`);
   const masked: Record<string, string> = Object.create(null);
   const fields: Descriptor["fields"] = [];
   for (const [name, f] of Object.entries(e.fields)) {
-    const pt = Buffer.from(decrypt(key, f.value)).toString("utf8");
+    if (f.source) {
+      // Describing must never read an external source: that would be a draw.
+      masked[name] = EXTERNAL_PREVIEW;
+      fields.push({ name, class: f.class, mask: f.mask, fingerprint: descriptorFingerprint(f), source: sourceLabel(f.source), ...expiryProjection(f) });
+      continue;
+    }
+    const pt = Buffer.from(decrypt(getMasterKey(), f.value!)).toString("utf8");
     masked[name] = f.class === "credential" ? "****" : mask(pt, f.mask);
     fields.push({ name, class: f.class, mask: f.mask, fingerprint: fingerprint(pt), ...expiryProjection(f) });
   }

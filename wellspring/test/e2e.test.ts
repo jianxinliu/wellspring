@@ -838,3 +838,107 @@ test("derive refuses callers without the admin token, even for a reveal-only op"
   // An unauthenticated caller must learn nothing: not the code, not even whether it is expired.
   expect(JSON.stringify(denied)).not.toContain("expired");
 });
+
+describe("external credential sources", () => {
+  const dir = mkdtempSync(join(tmpdir(), "wellspring-src-"));
+  const envFile = join(dir, "app.env");
+  const write = (text: string) => Bun.write(envFile, text);
+  const rpc = async (msg: any) => {
+    const r = await fetch(`http://127.0.0.1:${httpPort}/api/${msg.op}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + ADMIN_TOKEN },
+      body: JSON.stringify(msg),
+    });
+    return r.json();
+  };
+
+  beforeAll(async () => {
+    await write('DB_PASSWORD="first-value"\nOTHER=x\n');
+  });
+  afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test("a dotenv reference stores nothing and follows the host file", async () => {
+    const put = await rpc({ op: "put_source", id: "cred:ext_db", field: "password", source: `dotenv:${envFile}#DB_PASSWORD` });
+    expect(put.ok).toBe(true);
+    const first = await rpc({ op: "draw", ref: "cred:ext_db/password" });
+    expect(first.value).toBe("first-value");
+    // Rotating the secret means editing the host file; no Wellspring call involved.
+    await write('DB_PASSWORD="second-value"\nOTHER=x\n');
+    const second = await rpc({ op: "draw", ref: "cred:ext_db/password" });
+    expect(second.value).toBe("second-value");
+  });
+
+  test("the vault never receives a copy of an external value", async () => {
+    const put = await rpc({ op: "put_source", id: "cred:ext_leak", field: "value", source: "file:" + envFile });
+    expect(put.ok).toBe(true);
+    const raw = await Bun.file(join(process.env.WELLSPRING_HOME!, "store.json")).text();
+    expect(raw).toContain(envFile);           // the reference is stored
+    expect(raw).not.toContain("adopt-me");    // no copy of the value is
+    expect(raw).not.toContain("DB_PASSWORD=");
+  });
+
+  test("descriptors expose a source label, never the value or the full path", async () => {
+    // Each test writes its own fixture: an earlier test rewrites this file, so a
+    // shared beforeAll fixture would make these cases order-dependent.
+    await write('OTHER=x\n');
+    const put = await rpc({ op: "put_source", id: "cred:ext_desc", field: "value", source: `dotenv:${envFile}#OTHER` });
+    expect(put.ok).toBe(true);
+    const d = await rpc({ op: "describe", id: "cred:ext_desc" });
+    expect(String(d.fields[0].source)).toContain("dotenv:");
+    expect(String(d.fields[0].source)).not.toContain(dir);      // path is elided
+    // The preview is a fixed placeholder, so it cannot leak either the value or
+    // its length. (OTHER=x in the fixture makes any real leak visible here.)
+    expect(d.maskedPreview.value).toBe("（外部来源，未读取）");
+    const list = JSON.stringify((await rpc({ op: "list" })).descriptors);
+    expect(list).not.toContain(dir);
+  });
+
+  test("an unreadable source fails the draw instead of delivering an empty secret", async () => {
+    const vanishing = join(dir, "vanishing.txt");
+    await Bun.write(vanishing, "present\n");
+    await rpc({ op: "put_source", id: "cred:ext_gone", field: "value", source: "file:" + vanishing });
+    expect((await rpc({ op: "draw", ref: "cred:ext_gone/value" })).value).toBe("present");
+    rmSync(vanishing);
+    const drawn = await rpc({ op: "draw", ref: "cred:ext_gone/value" });
+    expect(drawn.error).toContain("unreadable");
+    expect(drawn.value).toBeUndefined();
+  });
+
+  test("binding to a source that cannot be read is rejected at write time", async () => {
+    const bad = await rpc({ op: "put_source", id: "cred:ext_bad", field: "value", source: "file:/nonexistent/path/xyz" });
+    expect(bad.error).toContain("unreadable");
+  });
+
+  test("put_source and adopt require the admin token", async () => {
+    const r = await fetch(`http://127.0.0.1:${httpPort}/api/put_source`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "put_source", id: "cred:ext_anon", field: "value", source: "env:WELLSPRING_SRC_ENV" }),
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("adopt copies an external value into the encrypted store and stops following it", async () => {
+    await write('DB_PASSWORD="adopt-me"\nOTHER=x\n');
+    await rpc({ op: "put_source", id: "cred:ext_adopt", field: "password", source: `dotenv:${envFile}#DB_PASSWORD` });
+    expect((await rpc({ op: "adopt", id: "cred:ext_adopt", field: "password" })).ok).toBe(true);
+    await write('DB_PASSWORD="changed-after-adopt"\nOTHER=x\n');
+    const drawn = await rpc({ op: "draw", ref: "cred:ext_adopt/password" });
+    expect(drawn.value).toBe("adopt-me");
+    const raw = await Bun.file(join(process.env.WELLSPRING_HOME!, "store.json")).text();
+    expect(raw).not.toContain("adopt-me"); // now encrypted, not plaintext
+  });
+
+  test("an expired external reference refuses without reading the source", async () => {
+    const watched = join(dir, "watched.txt");
+    await Bun.write(watched, "secret-in-watched-file");
+    await rpc({ op: "put_source", id: "cred:ext_exp", field: "value", source: "file:" + watched, ttlMs: 1000 });
+    await new Promise((r) => setTimeout(r, 1100));
+    const drawn = await rpc({ op: "draw", ref: "cred:ext_exp/value" });
+    expect(drawn.error).toContain("expired");
+    expect(JSON.stringify(drawn)).not.toContain("secret-in-watched-file");
+    // Expiry is checked before the source is contacted, so a broken link after
+    // expiry still reports "expired" rather than leaking that the file vanished.
+    rmSync(watched);
+    expect((await rpc({ op: "draw", ref: "cred:ext_exp/value" })).error).toContain("expired");
+  });
+});

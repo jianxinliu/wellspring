@@ -67,6 +67,42 @@ wellspring exec --secret TOKEN=cred:temp_key/value -- node app.js           # �
 
 `wellspring_exec` 需要 `command` 参数数组，可搭配 `env`、`fd`、`files` 引用映射。`env` 注入变量值；`fd` 通过 `WELLSPRING_FD_<名称>` 告知子进程只读凭据管道的描述符；`files` 注入 0600 临时文件路径并在执行后清理。还可用 `templates` 把模板文本渲染为临时配置文件。所有交付映射中的名称不可重复。
 
+## 外部来源（值不存进来）
+
+凭据不必存进 Wellspring。一个字段可以只记录**来源**，每次取用时现读：宿主机环境变量、某个文件、`.env` 里的某一项、钥匙串条目，或一条命令的输出。存储里只有来源地址，没有密文。
+
+```bash
+# 绑定到宿主机的 .env 里的某个变量（不需要把值敲进 shell，也就不会进 history）
+wellspring put cred:db_prod password --from 'dotenv:/Users/you/app/.env#DB_PASSWORD'
+
+# 其它来源
+wellspring put cred:api value  --from env:OPENAI_API_KEY
+wellspring put cred:ssh value  --from file:/Users/you/.ssh/id_ed25519
+wellspring put cred:gh  value  --from keychain:github-token
+wellspring put cred:dyn value  --from 'command:op read op://vault/db/password'
+```
+
+改宿主机文件即完成轮换，Wellspring 不用参与。反过来，如果想把外部值固化进加密存储（之后不再跟随宿主机），执行 `wellspring adopt <id> <field>`。
+
+| 来源 | 写法 | 说明 |
+|---|---|---|
+| 环境变量 | `env:NAME` | 读守护进程自己的环境 |
+| 文件 | `file:/绝对路径` | 整份文件内容，去掉末尾换行 |
+| .env | `dotenv:/绝对路径#KEY` | 支持 `#` 注释、`export`、引号、行内注释 |
+| 钥匙串 | `keychain:SERVICE` | macOS `security find-generic-password -s SERVICE -w` |
+| 命令 | `command:<shell 命令>` | 每次取用时执行，30s 超时 |
+
+行为约定：
+
+- **视图不读源。** `list`/`describe` 只显示来源标签（如 `dotenv:…app.env#DB_PASSWORD`，不含完整路径、不含值），预览固定为「（外部来源，未读取）」。看一眼列表不会触发读取。
+- **指纹描述来源，不描述值。** 换来源会变，宿主机轮换值不会变——这正是「值不在我们这里」的体现。
+- **写入时先试读一次。** 路径或变量名写错，在 `put --from` 当场就失败，而不是等到某次取用。
+- **过期检查先于读源。** 已经过期的引用不会去碰宿主机文件。
+- **读不到就失败，不返回空值。** 文件被删、变量没设、命令非零退出，都会让这次取用报错并计入审计。
+- 外部来源的值进不了 `<1 MiB` 以上：超过即拒绝。
+
+MCP 侧不提供写入来源的工具——把引用指向什么，是管理员动作；agent 只能看见标签。UI 的新增表单里有一个「或来源」输入框，填了就不存值。
+
 ## 派生运算（密钥不出守护进程）
 
 Agent 最常需要的是「用密钥算出的结果」，而不是密钥本身。`wellspring_derive` 只做计算，密钥始终留在 wellspringd：

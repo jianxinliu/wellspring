@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { listDescriptors, describe, getSecret, getSecretFresh, putSecret, deleteSecret, mask, fingerprint, isExpiryError, getMasterKey } from "../core/store.ts";
+import { listDescriptors, describe, getSecret, getSecretFresh, putSecret, putSource, adoptSource, deleteSecret, mask, fingerprint, isExpiryError, getMasterKey } from "../core/store.ts";
 import { totp, hmac, encryptAesGcm, decryptAesGcm } from "../core/derive.ts";
 
 export const WS_HOME = process.env.WELLSPRING_HOME ?? join(homedir(), ".wellspring");
@@ -232,6 +232,23 @@ export function handle(msg: any): any {
       // Rotation replaces the value without reading it, including when it has expired.
       putSecret(msg.id, msg.field, msg.value, { cls: msg.cls, mask: msg.mask, tags: msg.tags, ttlMs: msg.ttlMs, expiresAt: msg.expiresAt });
       logDraw({ ts: Date.now(), op: "put", entry: msg.id, field: msg.field, channel: "admin", verdict: "ok" });
+      return { ok: true };
+    }
+    // Attach a field to a source outside the vault (env / file / .env / keychain /
+    // command). Storing a reference is an admin action, so it needs the admin token,
+    // and it is recorded as such: the audit trail must show who pointed a ref at what.
+    case "put_source": {
+      if (burnToken(msg) !== "admin") return { error: "unauthorized" };
+      putSource(msg.id, msg.field, msg.source ?? msg.from, { cls: msg.cls, mask: msg.mask, tags: msg.tags, ttlMs: msg.ttlMs, expiresAt: msg.expiresAt });
+      logDraw({ ts: Date.now(), op: "put_source", entry: String(msg.id), field: String(msg.field), channel: "admin", verdict: "ok" });
+      return { ok: true };
+    }
+    // Turn an external reference into a locally encrypted copy, or the reverse of
+    // put_source. Recorded separately: copying a secret into the vault is a decision.
+    case "adopt": {
+      if (burnToken(msg) !== "admin") return { error: "unauthorized" };
+      adoptSource(msg.id, msg.field);
+      logDraw({ ts: Date.now(), op: "adopt", entry: String(msg.id), field: String(msg.field), channel: "admin", verdict: "ok" });
       return { ok: true };
     }
     case "delete": {

@@ -292,14 +292,38 @@ async function main() {
     }
     case "--help":
     case "help":
-      console.log("usage: wellspring <put|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ...\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
+      console.log("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ...\n  put ... --from <src>  Reference an external source instead of storing a copy\n  adopt      Copy an external source value into the vault\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
       break;
     case "put": {
-      const [id, field, value] = rest;
-      if (!id || !field || value === undefined) throw new Error("usage: put <id> <field> <value> [--cls] [--mask] [--tag] [--ttl 30s|15m|12h|7d]");
       const ttlRaw = flag("ttl");
       if (rest.includes("--ttl") && (!ttlRaw || ttlRaw.startsWith("--"))) throw new Error("--ttl requires a duration (e.g. 30s, 15m, 12h, 7d)");
+      const from = flag("from");
+      if (from !== undefined) {
+        // Reference mode: the value stays where it already lives. `put id field
+        // --from env:NAME` needs no third argument, so the secret is never typed
+        // into a shell (where it would land in history).
+        // `rest` still carries the flag pair, so count only positional words.
+        const positional = rest.filter((w, i) => !w.startsWith("--") && !(i > 0 && rest[i - 1].startsWith("--")));
+        const [refId, refField] = positional;
+        if (!refId || !refField || positional.length > 2) {
+          throw new Error("usage: put <id> <field> --from env:NAME | dotenv:/abs/path#KEY | file:/abs/path | keychain:SERVICE | command:...");
+        }
+        const r = await rpc({ op: "put_source", id: refId, field: refField, source: from, cls: flag("cls"), mask: flag("mask"), tags: flag("tag") ? [flag("tag")!] : undefined, ttlMs: ttlRaw ? parseTtlMs(ttlRaw) : undefined, token: adminToken() });
+        console.log(JSON.stringify(r));
+        break;
+      }
+      const [id, field, value] = rest;
+      if (!id || !field || value === undefined) throw new Error("usage: put <id> <field> <value> [--cls] [--mask] [--tag] [--ttl 30s|15m|12h|7d]\n       put <id> <field> --from env:NAME|dotenv:/abs/path#KEY|file:/abs/path|keychain:SERVICE|command:...");
       const r = await rpc({ op: "put", id, field, value, cls: flag("cls"), mask: flag("mask"), tags: flag("tag") ? [flag("tag")!] : undefined, ttlMs: ttlRaw ? parseTtlMs(ttlRaw) : undefined, token: adminToken() });
+      console.log(JSON.stringify(r));
+      break;
+    }
+    // Copy an external source's current value into the encrypted store, so the
+    // reference stops following the host (useful when the host will lose it).
+    case "adopt": {
+      const [id, field] = rest;
+      if (!id || !field || rest.length > 2) throw new Error("usage: adopt <id> <field>");
+      const r = await rpc({ op: "adopt", id, field, token: adminToken() });
       console.log(JSON.stringify(r));
       break;
     }
@@ -402,7 +426,7 @@ async function main() {
       process.exit(0);
     }
     default:
-      console.error("usage: wellspring <put|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ... (see --help)");
+      console.error("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ... (see --help)");
       process.exit(2);
   }
 }
