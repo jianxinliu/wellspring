@@ -1,0 +1,442 @@
+/// Wellspring Web UI + HTTP API, served by wellspringd on 127.0.0.1.
+/// Pages: 凭据库 (vault), 审计流水 (audit), 用量统计 (stats).
+/// API under /api/* uses the same ops as the unix socket. UI requires the admin
+/// token (entered once, kept in sessionStorage, sent as Bearer).
+import { createServer as httpCreate, IncomingMessage, ServerResponse } from "node:http";
+import { handle } from "./main.ts";
+
+export const HTTP_PORT = Number(process.env.WELLSPRING_HTTP_PORT ?? 7777);
+
+const MAX_BODY_BYTES = 1024 * 1024;
+const READ_OPS = new Set(["ping", "list", "describe", "view", "policy_get", "audit", "auth_check"]);
+const WRITE_OPS = new Set(["put", "delete", "policy_put", "resolve", "draw_env", "draw", "auth_issue_oneshot"]);
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const fail = (status: number, message: string) => {
+      if (settled) return;
+      settled = true;
+      chunks.length = 0;
+      reject(Object.assign(new Error(message), { status }));
+    };
+    req.on("error", () => fail(400, "request read failed"));
+    req.on("aborted", () => fail(400, "request aborted"));
+    req.on("close", () => { if (!req.complete) fail(400, "request closed before completion"); });
+    req.on("data", (chunk) => {
+      if (settled) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += bytes.length;
+      if (size > MAX_BODY_BYTES) { fail(413, "request body exceeds 1 MiB"); return; }
+      chunks.push(bytes);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    const length = Number(req.headers["content-length"]);
+    if (Number.isFinite(length) && length > MAX_BODY_BYTES) fail(413, "request body exceeds 1 MiB");
+  });
+}
+
+function json(res: ServerResponse, code: number, data: any) {
+  res.writeHead(code, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.end(JSON.stringify(data));
+}
+
+// A busy port must never take the daemon down: the UI is optional, the socket is not.
+export function startHttp(preferred = HTTP_PORT) {
+  const server = httpCreate(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const path = url.pathname;
+
+    // ---- API ----
+    if (path.startsWith("/api/")) {
+      const op = path.slice("/api/".length);
+      if (!READ_OPS.has(op) && !WRITE_OPS.has(op)) return json(res, 404, { error: "not found" });
+      if (req.method !== "POST" && !(req.method === "GET" && READ_OPS.has(op))) {
+        res.setHeader("allow", READ_OPS.has(op) ? "GET, POST" : "POST");
+        return json(res, 405, { error: "method not allowed" });
+      }
+      // Credentials belong only in Authorization, never URLs or JSON payloads.
+      const auth = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+      if (op !== "ping" && !handle({ op: "auth_check", token: auth }).ok) {
+        return json(res, 401, { error: "unauthorized" });
+      }
+      let body: any = Object.create(null);
+      if (req.method === "POST") {
+        try {
+          body = JSON.parse((await readBody(req)) || "{}");
+          if (!body || typeof body !== "object" || Array.isArray(body)) return json(res, 400, { error: "expected JSON object" });
+        } catch (e: any) {
+          return json(res, e?.status ?? 400, { error: e?.status ? e.message : "bad json" });
+        }
+      } else {
+        for (const [k, v] of url.searchParams) if (k !== "token") body[k] = v;
+      }
+      const msg: any = { ...body, op, token: auth };
+      try {
+        const result = handle(msg);
+        return json(res, 200, result);
+      } catch (e: any) {
+        return json(res, 500, { error: String(e?.message ?? e) });
+      }
+    }
+
+    // ---- UI ----
+    if (path === "/" || path === "/index.html") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      return res.end(HTML);
+    }
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  });
+  const announce = () => console.log(`wellspring web UI: http://127.0.0.1:${(server.address() as { port?: number })?.port}`);
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    // Fall back to an ephemeral port only for the default: an explicitly requested
+    // port must not silently move, because a human may have bookmarked it.
+    if (err.code === "EADDRINUSE" && preferred === HTTP_PORT) return server.listen(0, "127.0.0.1", announce);
+    console.error("web ui failed:", err.message);
+  });
+  server.listen(preferred, "127.0.0.1", announce);
+  return server;
+}
+
+const HTML = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wellspring · 凭证井</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a222c; --line:#2a3644; --fg:#e8eef4; --dim:#8fa3b3; --accent:#4fc3f7; --red:#ef5350; --orange:#ffa726; --green:#66bb6a; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.6 ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:14px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5; }
+  header h1 { font-size:18px; font-weight:600; }
+  header h1 span { color:var(--accent); }
+  nav { display:flex; gap:6px; margin-left:auto; }
+  nav button { background:none; border:1px solid var(--line); color:var(--dim); padding:6px 14px; border-radius:8px; cursor:pointer; font-size:13px; }
+  nav button.active { color:var(--fg); border-color:var(--accent); }
+  main { max-width:1100px; margin:0 auto; padding:24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin-bottom:12px; color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--dim); font-weight:500; padding:6px 10px; border-bottom:1px solid var(--line); }
+  td { padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  tr:hover td { background:rgba(79,195,247,.05); }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; }
+  .b-ok { background:rgba(102,187,106,.15); color:var(--green); }
+  .b-denied { background:rgba(239,83,80,.15); color:var(--red); }
+  .b-warn { background:rgba(255,167,38,.15); color:var(--orange); }
+  .b-cred { background:rgba(79,195,247,.12); color:var(--accent); }
+  .b-pii { background:rgba(255,167,38,.12); color:var(--orange); }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--dim); }
+  button { background:var(--card); color:var(--fg); border:1px solid var(--line); padding:7px 12px; border-radius:8px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button:focus-visible,input:focus-visible,select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .danger { color:var(--red); }
+  .notice { padding:10px; color:var(--green); min-height:40px; }
+  .table-wrap { overflow-x:auto; }
+  @media(max-width:640px) { header { flex-wrap:wrap; padding:12px; } nav { flex-wrap:wrap; margin:0; } main { padding:12px; } .kv { grid-template-columns:1fr; } }
+  input,select { background:var(--bg); border:1px solid var(--line); color:var(--fg); padding:6px 10px; border-radius:8px; font-size:13px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+  #login { max-width:420px; margin:80px auto; text-align:center; }
+  #login .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+  .bar { height:8px; border-radius:4px; background:var(--line); overflow:hidden; margin-top:4px; }
+  .bar > div { height:100%; background:var(--accent); }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 16px; font-size:13px; }
+  .kv b { color:var(--dim); font-weight:500; }
+  .empty { color:var(--dim); text-align:center; padding:30px; }
+  .stats-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:12px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .stat .num { font-size:26px; font-weight:600; }
+  .stat .lbl { color:var(--dim); font-size:12px; }
+  .usage-panel pre { white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0; padding:10px; background:var(--bg); }
+  .usage-panel p { color:var(--dim); }
+  .usage-panel button { margin-bottom:12px; }
+</style>
+</head>
+<body>
+<div id="login" class="card" style="display:none">
+  <h2>🔐 Wellspring 管理台</h2>
+  <p style="color:var(--dim);font-size:13px">本地守护进程凭证井 · 请输入 admin token</p>
+  <div class="row" style="justify-content:center;margin-top:16px">
+    <input id="tok-in" type="password" placeholder="admin token" style="width:240px" />
+    <button onclick="login()" style="padding:6px 18px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#08121a;cursor:pointer">进入</button>
+  </div>
+  <p class="hint">token 文件位于 ~/.wellspring/admin.token (0600)</p>
+</div>
+<header id="appbar" style="display:none">
+  <h1>💧 Wellspring <span>· 凭证井</span></h1>
+  <nav>
+    <button id="tab-vault" onclick="show('vault')">凭据库</button>
+    <button id="tab-audit" onclick="show('audit')">审计流水</button>
+    <button id="tab-stats" onclick="show('stats')">用量统计</button>
+    <button id="tab-policy" onclick="show('policy')">访问策略</button>
+    <button onclick="logout()">退出</button>
+  </nav>
+</header>
+<main id="app" style="display:none"></main>
+<script>
+const S = { token: sessionStorage.wst ?? "", tab: "vault", entries: [], events: [], policy: {} };
+
+async function api(op, body = {}) {
+  const r = await fetch("/api/" + op, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + S.token },
+    body: JSON.stringify(body),
+  });
+  const result = await r.json();
+  if (result.error) throw new Error(result.error);
+  return result;
+}
+function notify(message, failed = false) {
+  let el = document.getElementById('notice');
+  if (!el) { el = document.createElement('div'); el.id='notice'; el.className='notice'; el.setAttribute('role','status'); document.body.appendChild(el); }
+  el.textContent = message; el.style.color = failed ? 'var(--red)' : 'var(--green)';
+}
+window.addEventListener('unhandledrejection', e => { e.preventDefault(); notify(e.reason?.message ?? '操作失败，请重试', true); });
+
+function login() {
+  S.token = document.getElementById("tok-in").value.trim();
+  api("auth_check").then((r) => {
+    if (r.ok) { sessionStorage.wst = S.token; enter(); }
+    else notify("token 无效", true);
+  }).catch(() => notify('登录失败，请检查 token 或服务连接', true));
+}
+function logout() { sessionStorage.removeItem("wst"); location.reload(); }
+function enter() {
+  document.getElementById("login").style.display = "none";
+  document.getElementById("appbar").style.display = "flex";
+  document.getElementById("app").style.display = "block";
+  show(S.tab);
+}
+
+function show(tab) {
+  S.tab = tab;
+  for (const t of ["vault", "audit", "stats", "policy"]) document.getElementById("tab-" + t).classList.toggle("active", t === tab);
+  if (tab === "vault") renderVault();
+  if (tab === "audit") renderAudit();
+  if (tab === "stats") renderStats();
+  if (tab === "policy") renderPolicy();
+}
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function fmtTs(ts) { return new Date(ts).toLocaleString("zh-CN", { hour12: false }); }
+function verdictBadge(v) {
+  if (v === "ok") return '<span class="badge b-ok">ok</span>';
+  if (v === "denied_auth") return '<span class="badge b-denied">denied·auth</span>';
+  if (v === "denied_reason") return '<span class="badge b-warn">denied·reason</span>';
+  if (v === "denied_rate") return '<span class="badge b-warn">denied·rate</span>';
+  return '<span class="badge b-denied">' + esc(v) + "</span>";
+}
+
+// ---------- vault ----------
+async function renderVault() {
+  const app = document.getElementById("app");
+  app.innerHTML = '<div class="card"><div class="row"><input id="q" placeholder="搜索 id / 字段…" style="flex:1" oninput="drawVault()"><button onclick="showAdd()">＋ 新增凭据</button></div><div id="vault-tbl"></div></div>';
+  const r = await api("list");
+  S.entries = (r.descriptors ?? []).map(e => ({ ...e, id: e.ref.slice('secret://'.length) }));
+  drawVault();
+}
+function drawVault() {
+  const q = (document.getElementById("q")?.value ?? "").toLowerCase();
+  const rows = S.entries.filter((e) => !q || e.id.toLowerCase().includes(q) || e.fields.some((f) => f.name.includes(q)));
+  const el = document.getElementById("vault-tbl");
+  if (!rows.length) { el.innerHTML = '<div class="empty">（空 · 用 CLI put 或下方表单添加）</div>'; return; }
+  el.innerHTML = "<table><tr><th>条目</th><th>字段</th><th>类型</th><th>指纹</th><th>保护状态</th><th>标签</th><th>操作</th></tr>" +
+    rows.map((e) => {
+      const cls = e.id.startsWith("person:") ? "b-pii" : "b-cred";
+      return e.fields.map((f, i) =>
+        "<tr>" +
+        (i === 0 ? '<td rowspan="' + e.fields.length + '"><span class="badge ' + cls + '">' + esc(e.id) + "</span></td>" : "") +
+        "<td>" + esc(f.name) + "</td><td>" + esc(f.class ?? "credential") + "</td>" +
+        '<td class="mono">' + esc(f.fingerprint ?? "") + "</td>" +
+        '<td class="mono">' + esc(e.maskedPreview?.[f.name] ?? "****") + "</td>" +
+        (i === 0 ? '<td rowspan="' + e.fields.length + '">' + (e.tags ?? []).map(esc).join(", ") + "</td>" : "") +
+        '<td><button class="usage-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '" aria-expanded="false">使用</button> <button class="edit-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">轮换</button> <button class="danger delete-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">删除字段</button>' + (i === 0 ? ' <button class="danger delete-entry" data-entry="' + S.entries.indexOf(e) + '">删除条目</button>' : '') + '</td></tr>'
+      ).join("");
+    }).join("") + "</table>";
+  el.className = 'table-wrap';
+  el.querySelectorAll('.usage-field').forEach(b => b.onclick = () => showUsage(b));
+  el.querySelectorAll('.edit-field').forEach(b => b.onclick = () => showAdd(Number(b.dataset.entry), Number(b.dataset.field)));
+  el.querySelectorAll('.delete-field,.delete-entry').forEach(b => b.onclick = () => deleteEntry(Number(b.dataset.entry), b.classList.contains('delete-field') ? Number(b.dataset.field) : undefined));
+}
+function showUsage(button) {
+  const previous = document.getElementById('usage-panel');
+  const close = button.getAttribute('aria-expanded') === 'true';
+  document.querySelectorAll('.usage-field').forEach(b => b.setAttribute('aria-expanded', 'false'));
+  previous?.remove();
+  if (close) return;
+  const entry = S.entries[Number(button.dataset.entry)];
+  const field = entry.fields[Number(button.dataset.field)];
+  const ref = 'secret://' + entry.id + '/' + field.name;
+  // POSIX quoting keeps even punctuation in user-supplied refs literal.
+  const quote = value => "'" + value.split("'").join("'" + String.fromCharCode(92) + "''") + "'";
+  const examples = [
+    ['安全引用', ref],
+    ['CLI · 环境变量', 'wellspring exec --secret ' + quote('APP_SECRET=' + ref) + " -- '<program>' '<arg>'"],
+    ['CLI · 文件描述符', 'wellspring exec --secret-fd ' + quote('APP_SECRET=' + ref) + " -- '<program>' '<arg>'"],
+    ['CLI · 临时文件', 'wellspring exec --secret-file ' + quote('APP_SECRET_FILE=' + ref) + " -- '<program>' '<arg>'"],
+    ['CLI · Git askpass', 'wellspring exec --git-cred ' + quote(ref) + " -- git ls-remote 'https://<host>/<repo>.git'"],
+    ['配置模板内容（JSON）', '{"secret": {{' + ref + ' | json}}}'],
+    ['CLI · 模板配置', "wellspring exec --template-file 'APP_CONFIG=<template-path>' -- '<program>' '<arg>'"],
+    ['MCP · 模板配置', JSON.stringify({name:'wellspring_exec',arguments:{templates:{APP_CONFIG:'{"secret": {{' + ref + ' | json}}}'},command:['<program>','<arg>'],output:'none'}},null,2)],
+    ['MCP · tools/call JSON', JSON.stringify({name:'wellspring_exec',arguments:{env:{APP_SECRET:ref},command:['<program>','<arg>'],output:'none'}}, null, 2)],
+  ];
+  const row = document.createElement('tr'); row.id = 'usage-panel';
+  const cell = document.createElement('td'); cell.colSpan = 7; cell.className = 'usage-panel';
+  const heading = document.createElement('h3'); heading.textContent = '使用 ' + entry.id + '/' + field.name; cell.appendChild(heading);
+  const note = document.createElement('p');
+  note.textContent = '仅展示引用，不读取明文。替换占位 argv，选择可信程序且不要打印秘密。FD 号由 WELLSPRING_FD_APP_SECRET 提供；APP_SECRET_FILE 是自动清理的临时文件路径。Git 使用一次性 askpass；MCP 示例默认不返回输出。';
+  cell.appendChild(note);
+  for (const [label, text] of examples) {
+    const title = document.createElement('h4'); title.textContent = label;
+    const pre = document.createElement('pre'); pre.textContent = text;
+    const copy = document.createElement('button'); copy.textContent = '复制';
+    copy.onclick = async () => {
+      try { await navigator.clipboard.writeText(text); notify('已复制引用示例'); }
+      catch { const selection = window.getSelection(); const range = document.createRange(); range.selectNodeContents(pre); selection.removeAllRanges(); selection.addRange(range); notify('请复制已选中的示例', true); }
+    };
+    cell.append(title, pre, copy);
+  }
+  row.appendChild(cell); button.closest('tr').after(row); button.setAttribute('aria-expanded', 'true');
+}
+async function deleteEntry(index, fieldIndex) {
+  const entry = S.entries[index]; const field = fieldIndex === undefined ? undefined : entry.fields[fieldIndex].name;
+  if (!confirm('确认删除 ' + entry.id + (field ? '/' + field : ' 的全部字段') + '？删除后无法恢复。')) return;
+  await api('delete', {id:entry.id, field});
+  notify('已删除'); await renderVault();
+}
+function showAdd(index, fieldIndex) {
+  document.getElementById('add-form')?.remove();
+  const entry = index === undefined ? undefined : S.entries[index];
+  const field = entry?.fields[fieldIndex];
+  const app = document.getElementById("app");
+  app.insertAdjacentHTML("afterbegin",
+    '<div class="card" id="add-form"><h2>新增凭据</h2>' +
+    '<div class="kv"><b>id</b><input id="f-id" placeholder="cred:github_pat / person:zhang_san">' +
+    '<b>字段名</b><input id="f-field" placeholder="value / password / phone">' +
+    '<b>值</b><input id="f-val" type="password" placeholder="明文（仅写入加密存储）">' +
+    '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
+    '<b>标签</b><input id="f-tags" placeholder="逗号分隔，如 production, github">' +
+    '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select><b>脱敏说明</b><span id="f-mask-note">选择保存时使用的脱敏方式。</span></div>' +
+    '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>');
+  if (entry) {
+    document.querySelector('#add-form h2').textContent = '轮换字段（原值不会被读取）';
+    document.getElementById('f-id').value=entry.id; document.getElementById('f-id').readOnly=true;
+    document.getElementById('f-field').value=field.name; document.getElementById('f-field').readOnly=true;
+    document.getElementById('f-cls').value=field.class;
+    document.getElementById('add-form').dataset.tags=JSON.stringify(entry.tags ?? []);
+    document.getElementById('f-tags').value=(entry.tags ?? []).join(', ');
+    // Tags are entry-wide; retain their exact strings during field rotation.
+    document.getElementById('f-tags').readOnly=true;
+    const select = document.getElementById('f-mask');
+    if (typeof field.mask === 'string') {
+      if (!Array.from(select.options).some(o => o.value === field.mask)) select.add(new Option(field.mask, field.mask));
+      select.value=field.mask;
+      document.getElementById('f-mask-note').textContent='已保留描述符提供的原脱敏方式。';
+    } else {
+      select.add(new Option('请选择脱敏方式', ''), 0); select.value='';
+      document.getElementById('f-mask-note').textContent='描述符未提供原脱敏方式，无法自动保留；请明确选择轮换后的方式。标签保持不变。';
+    }
+  }
+  document.getElementById('f-val').focus();
+}
+async function addPut() {
+  const body = {
+    id: document.getElementById("f-id").value, field: document.getElementById("f-field").value || "value",
+    value: document.getElementById("f-val").value, cls: document.getElementById("f-cls").value || undefined,
+    mask: document.getElementById("f-mask").value,
+    tags: document.getElementById('add-form').dataset.tags !== undefined
+      ? JSON.parse(document.getElementById('add-form').dataset.tags)
+      : document.getElementById('f-tags').value.split(',').map(s => s.trim()).filter(Boolean),
+  };
+  if (!body.id.trim() || !body.value) { notify('请填写条目 ID 和值', true); return; }
+  if (!body.mask) { notify('请明确选择脱敏方式后保存', true); return; }
+  const r = await api("put", body);
+  if (r.ok) { document.getElementById('f-val').value=''; document.getElementById("add-form").remove(); notify('已加密保存'); renderVault(); }
+}
+
+async function renderPolicy() {
+  const r = await api('policy_get'); S.policy=r.policy;
+  document.getElementById('app').innerHTML='<div class="card"><h2>个人信息访问策略</h2><p>只有白名单中的业务原因能够请求明文解析。限速按字段计算。</p><div class="kv"><label for="p-reasons">允许原因（逗号分隔）</label><input id="p-reasons"><label for="p-rate">每分钟最多解析次数</label><input id="p-rate" type="number" min="1" max="10000"></div><div class="row"><button onclick="savePolicy()">保存策略</button></div></div>';
+  document.getElementById('p-reasons').value=r.policy.resolveReasons.join(', ');
+  document.getElementById('p-rate').value=r.policy.resolveRatePerMin;
+}
+async function savePolicy() {
+  const policy={resolveReasons:document.getElementById('p-reasons').value.split(',').map(s=>s.trim()).filter(Boolean),resolveRatePerMin:Number(document.getElementById('p-rate').value)};
+  await api('policy_put',{policy}); notify('策略已保存');
+}
+
+// ---------- audit ----------
+function parseAudit(lines) {
+  return (Array.isArray(lines) ? lines : []).flatMap(line => {
+    try {
+      const e = JSON.parse(line);
+      return e && typeof e === 'object' && !Array.isArray(e) &&
+        ['op','entry','field','channel','verdict'].every(k => typeof e[k] === 'string') &&
+        typeof e.ts === 'number' && Number.isFinite(e.ts) ? [e] : [];
+    } catch { return []; }
+  }).reverse();
+}
+async function renderAudit() {
+  const app = document.getElementById("app");
+  app.innerHTML = '<div class="card"><div class="row"><input id="aq" placeholder="过滤：op / entry / verdict…" style="flex:1" oninput="drawAudit()"></div><div id="audit-tbl"></div></div>';
+  const r = await api("audit");
+  S.events = parseAudit(r.events);
+  drawAudit();
+}
+function drawAudit() {
+  const q = (document.getElementById("aq")?.value ?? "").toLowerCase();
+  const evs = S.events.filter((e) => !q || JSON.stringify(e).toLowerCase().includes(q)).slice(0, 300);
+  const el = document.getElementById("audit-tbl");
+  if (!evs.length) { el.innerHTML = '<div class="empty">（暂无事件）</div>'; return; }
+  el.innerHTML = "<table><tr><th>时间</th><th>操作</th><th>条目</th><th>字段</th><th>通道</th><th>原因</th><th>结果</th></tr>" +
+    evs.map((e) => "<tr><td class='mono'>" + fmtTs(e.ts) + "</td><td>" + esc(e.op) + "</td><td>" + esc(e.entry) + "</td><td>" + esc(e.field) + "</td><td class='mono'>" + esc(e.channel) + "</td><td>" + esc(e.reason ?? "—") + "</td><td>" + verdictBadge(e.verdict) + "</td></tr>").join("") + "</table>";
+}
+
+// ---------- stats ----------
+async function renderStats() {
+  const app = document.getElementById("app");
+  const [audit, vault] = await Promise.all([api('audit'), api('list')]);
+  S.entries = vault.descriptors ?? [];
+  const evs = parseAudit(audit.events);
+  S.events = evs;
+  const draws = evs.filter(e => ['draw', 'draw_env', 'resolve'].includes(e.op));
+  const ok = draws.filter((e) => e.verdict === "ok");
+  const admin = evs.filter(e => !['draw', 'draw_env', 'resolve'].includes(e.op) && e.verdict === 'ok');
+  const denied = evs.filter((e) => e.verdict.startsWith('denied_'));
+  const errors = evs.filter(e => e.verdict === 'error');
+  const byOp = Object.create(null), byEntry = Object.create(null), byChannel = Object.create(null);
+  for (const e of evs) { byOp[e.op] = (byOp[e.op] ?? 0) + 1; byChannel[e.channel] = (byChannel[e.channel] ?? 0) + 1; }
+  for (const e of ok) byEntry[e.entry] = (byEntry[e.entry] ?? 0) + 1;
+  const top = (o, n = 8) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, n);
+  const max = Math.max(1, ...Object.values(byEntry));
+  const p = await api("policy_get");
+  app.innerHTML =
+    '<div class="stats-grid">' +
+    '<div class="stat"><div class="num">' + evs.length + '</div><div class="lbl">总事件</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--green)">' + ok.length + '</div><div class="lbl">成功出水</div></div>' +
+    '<div class="stat"><div class="num">' + admin.length + '</div><div class="lbl">成功管理操作</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--red)">' + denied.length + '</div><div class="lbl">被拒绝</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--orange)">' + errors.length + '</div><div class="lbl">操作错误</div></div>' +
+    '<div class="stat"><div class="num">' + S.entries.length + '</div><div class="lbl">凭据条目</div></div>' +
+    '</div>' +
+    '<div class="card"><h2>按条目成功出水频次</h2>' + top(byEntry).map(([k, v]) =>
+      '<div style="margin:6px 0"><div class="row" style="margin:0"><span class="mono" style="width:200px">' + esc(k) + '</span><span class="mono">' + v + '</span></div><div class="bar"><div style="width:' + (v / max * 100) + '%"></div></div></div>').join("") + '</div>' +
+    '<div class="card"><h2>按操作</h2><div class="kv">' + Object.entries(byOp).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
+    '<div class="card"><h2>按通道</h2><div class="kv">' + Object.entries(byChannel).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
+    '<div class="card"><h2>当前策略</h2><div class="kv"><b>resolve 白名单</b><span>' + (p.policy?.resolveReasons ?? []).map(esc).join(", ") + '</span><b>限速</b><span>' + esc(p.policy?.resolveRatePerMin ?? "-") + ' 次/分/字段</span></div></div>';
+}
+
+// boot: token present -> try ping; else show login
+if (S.token) api("auth_check").then(() => enter()).catch(() => { sessionStorage.removeItem('wst'); document.getElementById('login').style.display='block'; });
+else document.getElementById("login").style.display = "block";
+</script>
+</body>
+</html>`;

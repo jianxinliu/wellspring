@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" role="img" aria-label="Wellspring logo">
+  <defs>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#63E6BE"/>
+      <stop offset="55%" stop-color="#3BC9DB"/>
+      <stop offset="100%" stop-color="#1C7ED6"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#E7F5FF"/>
+      <stop offset="100%" stop-color="#A5D8FF"/>
+    </linearGradient>
+    <clipPath id="wellClip">
+      <circle cx="120" cy="120" r="56"/>
+    </clipPath>
+  </defs>
+
+  <!-- 外环：井口 / 圆环。
+       断开的三段 = 开口的缺口，隐喻「有入口，但边界完整」 -->
+  <circle cx="120" cy="120" r="94" fill="none" stroke="url(#rim)" stroke-width="9"
+          stroke-linecap="round" stroke-dasharray="150 34 130 34 150 34" opacity="0.9"/>
+
+  <!-- 井身：内圈 -->
+  <circle cx="120" cy="120" r="64" fill="none" stroke="#1C7ED6" stroke-width="6" opacity="0.35"/>
+
+  <!-- 水面 -->
+  <g clip-path="url(#wellClip)">
+    <rect x="60" y="120" width="120" height="60" fill="url(#water)" opacity="0.95"/>
+    <path d="M60 122 Q80 112 100 122 T140 122 T180 122 V182 H60 Z" fill="url(#water)"/>
+    <!-- 涟漪 -->
+    <path d="M60 140 Q80 132 100 140 T140 140 T180 140" fill="none"
+          stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" opacity="0.45"/>
+    <path d="M60 156 Q80 149 100 156 T140 156 T180 156" fill="none"
+          stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" opacity="0.28"/>
+  </g>
+
+  <!-- 水珠：从水面升起的一滴，隐喻「被取走的一份信息」 -->
+  <path d="M120 52 C120 52 106 72 106 83 C106 91 112 97 120 97 C128 97 134 91 134 83 C134 72 120 52 120 52 Z"
+        fill="url(#water)"/>
+
+  <!-- 锁孔：底部的小小锁芯，隐喻「受控、有钥匙」 -->
+  <circle cx="120" cy="146" r="7" fill="#FFFFFF" opacity="0.92"/>
+  <rect x="117.5" y="150" width="5" height="13" rx="2.5" fill="#FFFFFF" opacity="0.92"/>
+</svg>
