@@ -10,6 +10,8 @@ Agent ──MCP(stdio)──┐                    ┌─ CLI（人/脚本）
 
 ## 快速开始
 
+源码运行要求 Bun 1.3.11 或更新版本。在本目录运行 `bun install` 安装依赖，再执行以下命令。编译后的三个二进制不依赖本机安装 Bun；当前构建对应本机平台。源码包注册了 `wellspring`、`wellspringd`、`wellspring-mcp` 三个命令入口，也可直接使用下面的 `bun run` 命令。
+
 ```bash
 # 1. 启动守护进程（unix socket + Web UI）
 bun run src/daemon/main.ts        # 或 ./wellspringd-bin

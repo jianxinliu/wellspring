@@ -1,4 +1,5 @@
-/// Wellspring MCP server (stdio). Agent-facing: descriptors only, never plaintext.
+#!/usr/bin/env bun
+/// Wellspring MCP server (stdio). Descriptors, credential delivery and derived results.
 /// Tools: wellspring_list, wellspring_describe, wellspring_exec, wellspring_derive.
 /// Uses minimal MCP stdio JSON-RPC (initialize / tools/list / tools/call) — Phase 0
 /// avoids the SDK dependency to keep the compiled binary dependency-free.

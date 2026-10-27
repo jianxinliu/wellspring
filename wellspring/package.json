@@ -3,7 +3,12 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Sensitive-info waterworks for AI agents: store credentials & PII, deliver without exposing plaintext",
-  "bin": { "wellspring": "./src/cli/main.ts", "wellspringd": "./src/daemon/main.ts" },
+  "bin": {
+    "wellspring": "./src/cli/main.ts",
+    "wellspringd": "./src/daemon/main.ts",
+    "wellspring-mcp": "./src/mcp/server.ts"
+  },
+  "engines": { "bun": ">=1.3.11" },
   "scripts": {
     "test": "bun test --timeout 30000",
     "build": "bun build --compile src/cli/main.ts --outfile wellspring-bin && bun build --compile src/daemon/main.ts --outfile wellspringd-bin && bun build --compile src/mcp/server.ts --outfile wellspring-mcp-bin",

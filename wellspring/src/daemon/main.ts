@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 /// Wellspring daemon (wellspringd): unix-socket JSON-RPC, sole owner of the store.
 /// Protocol: newline-delimited JSON {op, ...} -> {ok, ...} | {ok:false, error}
 /// AUTH: sensitive ops (draw_env, draw_fd, resolve) require a draw token.

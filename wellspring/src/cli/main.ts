@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 /// Wellspring CLI: put / delete / list / describe / view / resolve / policy / audit / exec / derive / askpass
 /// exec = A1 (env) + A2 (fd) channels. Plaintext lives only in this process + child fds.
 import { connect } from "node:net";
