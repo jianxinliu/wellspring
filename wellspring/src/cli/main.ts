@@ -53,6 +53,16 @@ function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\\''") + "'";
 }
 
+// Duration -> ms. Accepts a bare number of seconds, or a number with a unit suffix:
+// s (秒), m (分钟), h (小时), d (天). Empty/invalid input throws with a usage hint.
+export function parseTtlMs(input: string): number {
+  const m = /^(\d+)(s|m|h|d)?$/.exec(input.trim());
+  if (!m) throw new Error(`invalid --ttl: ${input} (use e.g. 30s, 15m, 12h, 7d, or a bare second count)`);
+  const n = Number(m[1]);
+  const scale = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] ?? "s"] as number;
+  return n * scale;
+}
+
 async function exec(rest: string[]): Promise<number> {
   const dash = rest.indexOf("--");
   if (dash < 0) throw new Error("usage: exec [--secret NAME=ref] [--secret-fd NAME=ref] [--secret-file NAME=ref] [--template-file NAME=path] [--git-cred ref] -- <cmd...>");
@@ -236,8 +246,10 @@ async function main() {
   switch (cmd) {
     case "put": {
       const [id, field, value] = rest;
-      if (!id || !field || value === undefined) throw new Error("usage: put <id> <field> <value> [--cls] [--mask] [--tag]");
-      const r = await rpc({ op: "put", id, field, value, cls: flag("cls"), mask: flag("mask"), tags: flag("tag") ? [flag("tag")!] : undefined, token: adminToken() });
+      if (!id || !field || value === undefined) throw new Error("usage: put <id> <field> <value> [--cls] [--mask] [--tag] [--ttl 30s|15m|12h|7d]");
+      const ttlRaw = flag("ttl");
+      if (rest.includes("--ttl") && (!ttlRaw || ttlRaw.startsWith("--"))) throw new Error("--ttl requires a duration (e.g. 30s, 15m, 12h, 7d)");
+      const r = await rpc({ op: "put", id, field, value, cls: flag("cls"), mask: flag("mask"), tags: flag("tag") ? [flag("tag")!] : undefined, ttlMs: ttlRaw ? parseTtlMs(ttlRaw) : undefined, token: adminToken() });
       console.log(JSON.stringify(r));
       break;
     }

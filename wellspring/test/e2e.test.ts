@@ -12,15 +12,19 @@ process.env.WELLSPRING_ADMIN_TOKEN = ADMIN_TOKEN;
 
 let daemon: ChildProcess;
 
-beforeAll(() => {
+beforeAll(async () => {
   daemon = spawn("bun", ["run", join(import.meta.dir, "../src/daemon/main.ts")], {
     env: { ...process.env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  return new Promise<void>((res) => {
-    daemon.stdout!.on("data", (c: Buffer) => { if (c.toString().includes("listening")) res(); });
-    setTimeout(res, 2000);
-  });
+  // Wait for the socket to actually answer. A fixed sleep races a loaded machine:
+  // when it loses, every later test fails with ENOENT instead of a real signal.
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    try { if ((await rpc({ op: "ping" })).pong) return; } catch { /* not up yet */ }
+  }
+  throw new Error("daemon failed to start within 30s");
 });
 
 afterAll(() => {
@@ -388,6 +392,41 @@ test('CLI template config is valid, private and removed after exit',async()=>{
   expect(existsSync(out.split('\n')[0])).toBe(false);expect(out).not.toContain('hunter2');
 });
 
+// A crashed daemon leaves a socket file that answers nothing; a restart must reclaim it.
+// The daemon runs forever, so each launch is spawned, observed and then killed.
+async function startDaemonObserved(env: Record<string, string | undefined>, stopAfter: RegExp) {
+  const child = spawn("bun", ["run", join(import.meta.dir, "..", "src/daemon/main.ts")], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  let log = "";
+  const collect = (c: Buffer) => { log += c.toString(); };
+  child.stdout!.on("data", collect);
+  child.stderr!.on("data", collect);
+  const deadline = Date.now() + 25000;
+  while (!stopAfter.test(log) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+  child.kill("SIGKILL");
+  return log;
+}
+
+test("daemon reclaims a stale socket file and refuses a live one", async () => {
+  const { createServer } = await import("node:net");
+  const staleDir = mkdtempSync(join(tmpdir(), "ws-stale-"));
+  const sock = join(staleDir, "wellspringd.sock");
+  // Emulate a crashed daemon: the socket file remains, but no process owns it.
+  await new Promise<void>((res) => { const s = createServer(() => {}); s.listen(sock, () => { s.close(); res(); }); });
+  const env = { WELLSPRING_HOME: staleDir, WELLSPRING_SOCK: sock, WELLSPRING_ADMIN_TOKEN: "stale-probe" };
+  expect(await startDaemonObserved(env, /listening/)).toContain("listening");
+  // With a live daemon holding the socket, a second one must refuse instead of stealing it.
+  const live = spawn("bun", ["run", join(import.meta.dir, "..", "src/daemon/main.ts")], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  let liveLog = "";
+  live.stdout!.on("data", (c: Buffer) => { liveLog += c.toString(); });
+  const deadline = Date.now() + 25000;
+  while (!liveLog.includes("listening") && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+  const collision = await startDaemonObserved(env, /already listening|listening/);
+  expect(collision).toContain("already listening");
+  expect(collision).not.toContain("wellspringd listening");
+  live.kill("SIGKILL");
+  rmSync(staleDir, { recursive: true, force: true });
+}, 60000);
+
 test("exec C1: secret-file rendered 0600, removed after exit", async () => {
   const { rmSync, existsSync, statSync } = await import("node:fs");
   const tmp = mkdtempSync(join(tmpdir(), "ws-c1-"));
@@ -424,4 +463,97 @@ test("exec ssh recipe: SSH_ASKPASS helper answers with secret", async () => {
   expect(text).toContain("SSH_ASKPASS_REQUIRE: force");
   expect(text).toContain("env clean: true");
   expect(text.includes("hunter2")).toBe(false);
+});
+
+// ---- A3: short-lived credentials (TTL / expiry) ----
+
+async function freshSecret(id: string, field: string, value: string, opts: Record<string, unknown> = {}) {
+  const r = await rpc({ op: "put", id, field, value, ...opts, ...AUTH });
+  expect(r.ok).toBe(true);
+  return r;
+}
+
+test("TTL: expired secret yields no plaintext and is audited as expired", async () => {
+  // 1s is the shortest TTL web.ts exposes; wait past it to cross the boundary.
+  await freshSecret("cred:short", "value", "ephemeral-plaintext-AAA", { ttlMs: 1000 });
+  expect((await rpc({ op: "resolve", id: "cred:short", field: "value", reason: "my_reason", ...AUTH })).value).toBe("ephemeral-plaintext-AAA");
+  await Bun.sleep(1100);
+  const after = await rpc({ op: "resolve", id: "cred:short", field: "value", reason: "my_reason", ...AUTH });
+  expect(after.error).toContain("expired");
+  expect(JSON.stringify(after)).not.toContain("ephemeral-plaintext-AAA");
+  const draw = await rpc({ op: "draw", ref: "secret://cred:short/value", ...AUTH });
+  expect(draw.error).toContain("expired");
+  expect(draw.value).toBeUndefined();
+  expect((await rpc({ op: "draw", ref: "secret://cred:short/value", token: "bad" })).error).toBe("unauthorized");
+  const evs = (await rpc({ op: "audit", ...AUTH })).events.map((l: string) => JSON.parse(l));
+  expect(evs.some((e: any) => e.op === "resolve" && e.entry === "cred:short" && e.verdict === "expired")).toBe(true);
+});
+
+test("TTL: list and describe expose expiry metadata but never plaintext", async () => {
+  await freshSecret("cred:dated", "value", "dated-plaintext-BBB", { ttlMs: 60_000 });
+  const list = await rpc({ op: "list", ...AUTH });
+  const entry = list.descriptors.find((d: any) => d.ref === "secret://cred:dated");
+  expect(typeof entry.fields[0].expiresAt).toBe("number");
+  expect(entry.fields[0].expired).toBe(false);
+  expect(JSON.stringify(list)).not.toContain("dated-plaintext-BBB");
+  const d = await rpc({ op: "describe", id: "cred:dated", ...AUTH });
+  expect(typeof d.fields[0].expiresAt).toBe("number");
+  expect(d.fields[0].expired).toBe(false);
+});
+
+test("TTL: validation rejects conflicting, out-of-range and past expiry inputs", async () => {
+  expect((await rpc({ op: "put", id: "cred:bad_ttl", field: "value", value: "x", ttlMs: 1000, expiresAt: Date.now() + 5000, ...AUTH })).error).toContain("not both");
+  expect((await rpc({ op: "put", id: "cred:bad_ttl", field: "value", value: "x", ttlMs: 500, ...AUTH })).error).toBeDefined();
+  expect((await rpc({ op: "put", id: "cred:bad_ttl", field: "value", value: "x", ttlMs: Date.now() + 31_536_000_001, ...AUTH })).error).toBeDefined();
+  expect((await rpc({ op: "put", id: "cred:bad_ttl", field: "value", value: "x", expiresAt: Date.now() - 1000, ...AUTH })).error).toBeDefined();
+  expect((await rpc({ op: "describe", id: "cred:bad_ttl", ...AUTH })).error).toBeDefined();
+});
+
+test("TTL: rotation refreshes plaintext and clears a stale expiry", async () => {
+  await freshSecret("cred:rotate_ttl", "value", "rotate-plaintext-CCC", { ttlMs: 1000 });
+  await Bun.sleep(1100);
+  expect((await rpc({ op: "resolve", id: "cred:rotate_ttl", field: "value", reason: "my_reason", ...AUTH })).error).toContain("expired");
+  // Rotation on an expired credential must still succeed: the operator is replacing it, not reading it.
+  await freshSecret("cred:rotate_ttl", "value", "rotate-plaintext-DDD");
+  expect((await rpc({ op: "resolve", id: "cred:rotate_ttl", field: "value", reason: "my_reason", ...AUTH })).value).toBe("rotate-plaintext-DDD");
+  const d = await rpc({ op: "describe", id: "cred:rotate_ttl", ...AUTH });
+  expect(d.fields[0].expiresAt).toBeUndefined();
+});
+
+test("TTL: unauthenticated draw learns nothing about expiry", async () => {
+  await freshSecret("cred:auth_first", "value", "auth-plaintext-EEE", { ttlMs: 1000 });
+  await Bun.sleep(1100);
+  // Bad token against an expired secret must fail as "unauthorized", never "expired":
+  // otherwise expiry itself leaks to an unauthenticated caller.
+  const r = await rpc({ op: "resolve", id: "cred:auth_first", field: "value", reason: "my_reason", token: "wrong-token" });
+  expect(r.error).toBe("unauthorized");
+  expect(JSON.stringify(r)).not.toContain("expired");
+  expect(JSON.stringify(r)).not.toContain("auth-plaintext-EEE");
+});
+
+test("TTL: draw_env never hands out a partial environment", async () => {
+  await freshSecret("cred:env_ok", "value", "env-plaintext-FFF", { ttlMs: 60_000 });
+  await freshSecret("cred:env_bad", "value", "env-plaintext-GGG", { ttlMs: 1000 });
+  await Bun.sleep(1100);
+  const r = await rpc({ op: "draw_env", env: { A: "secret://cred:env_ok/value", B: "secret://cred:env_bad/value" }, ...AUTH });
+  expect(r.error).toContain("expired");
+  expect(r.env).toBeUndefined();
+  expect(JSON.stringify(r)).not.toContain("env-plaintext-FFF");
+  expect(JSON.stringify(r)).not.toContain("env-plaintext-GGG");
+});
+
+test("CLI: --ttl accepts durations and enforces expiry", async () => {
+  const cli = (args: string[]) => Bun.spawnSync({
+    cmd: ["bun", "run", join(import.meta.dir, "..", "src/cli/main.ts"), ...args],
+    env: { ...process.env },
+  });
+  expect(cli(["put", "cred:cli_ttl", "value", "cli-plaintext-HHH", "--ttl", "1s"]).stdout.toString()).toContain('"ok":true');
+  const view = JSON.parse(cli(["resolve", "cred:cli_ttl/value", "--reason", "my_reason"]).stdout.toString());
+  expect(view.value).toBe("cli-plaintext-HHH");
+  await Bun.sleep(1100);
+  const expired = cli(["resolve", "cred:cli_ttl/value", "--reason", "my_reason"]);
+  expect(expired.exitCode).not.toBe(0);
+  expect(expired.stderr.toString()).toContain("expired");
+  expect(expired.stdout.toString() + expired.stderr.toString()).not.toContain("cli-plaintext-HHH");
+  expect(cli(["put", "cred:cli_bad", "value", "x", "--ttl", "soon"]).exitCode).not.toBe(0);
 });

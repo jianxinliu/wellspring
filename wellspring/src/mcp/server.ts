@@ -44,12 +44,12 @@ function rpc(msg: object): Promise<any> {
 const TOOLS = [
   {
     name: "wellspring_list",
-    description: "List all sensitive-info descriptors this agent may use. Returns refs (secret://...), field fingerprints and available recipes. NEVER returns plaintext.",
+    description: "List all sensitive-info descriptors this agent may use. Returns refs (secret://...), field fingerprints, expiry (expiresAt/expired) and available recipes. NEVER returns plaintext.",
     inputSchema: { type: "object", properties: { tag: { type: "string" } } },
   },
   {
     name: "wellspring_describe",
-    description: "Describe one entry: fields with sha256 fingerprints (first 16 hex), masked previews for PII, recipes. No plaintext.",
+    description: "Describe one entry: fields with sha256 fingerprints (first 16 hex), masked previews for PII, expiry (expiresAt/expired), recipes. No plaintext.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string", description: "e.g. cred:db_prod or person:zhang_san" } },

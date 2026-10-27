@@ -10,7 +10,8 @@
 | [research-runtime-isolation-report.md](./research-runtime-isolation-report.md) | 分报告 A：运行时隔离 / 沙箱 / 出口代理 / 凭证注入实现细节 |
 | [research-credential-broker-report.md](./research-credential-broker-report.md) | 分报告 B：密钥管理与凭证网关产品（Vault、Infisical、Keycard、NHI 厂商、云厂商） |
 | [research-mcp-report.md](./research-mcp-report.md) | 分报告 C：MCP 生态的凭证处理（网关、secrets server、三种姿势对比、CVE） |
-| [research-risks-standards-report.md](./research-risks-standards-report.md) | 分报告 D：风险证据（泄露统计、prompt injection PoC）、标准、最佳实践、capability token |
+| [design/CREDENTIAL-WATERWORKS-DESIGN.md](./design/CREDENTIAL-WATERWORKS-DESIGN.md) | **自研设计**：Wellspring 分发式凭证工具（三对象模型、15 种交付通道、PII 三档、命名与图标） |
+| [wellspring/](./wellspring) | **实现**：Bun/TS 单二进制，MCP + CLI + Web 管理台，含端到端测试 |
 
 ## 一句话结论
 
@@ -25,6 +26,7 @@
 
 | 场景 | 推荐 |
 |---|---|
+| 通用 agent、想要「凭证可审计可撤销的一次握手」 | **Wellspring（本仓库自带实现）** |
 | 个人/小团队、当天就想上 | LiteLLM 虚拟 key + 自建出口代理（Cloudflare Worker / mitmproxy） |
 | 已用 Docker Desktop | Docker MCP Gateway（secrets 按 server 隔离 + `--block-secrets`） |
 | 已用 K8s + Vault | Vault Dynamic Secrets + Agent Injector / VSO |

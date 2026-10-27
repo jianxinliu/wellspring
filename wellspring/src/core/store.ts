@@ -58,6 +58,7 @@ export type Field = {
   value: string; // encrypted b64 (or plaintext if store not sealed yet — never, we seal on write)
   class: Class;
   mask?: string; // for pii: keep1 | phone | region | none
+  expiresAt?: number; // epoch ms; after this instant the daemon refuses to draw the value
 };
 
 export type Entry = {
@@ -101,7 +102,38 @@ function validateKey(value: unknown, name: "id" | "field"): asserts value is str
   }
 }
 
-export function putSecret(id: string, field: string, plaintext: string, opts?: { cls?: Class; mask?: string; tags?: string[] }) {
+export const MIN_TTL_MS = 1000;                 // 1 second
+export const MAX_TTL_MS = 31_536_000_000;       // 1 year (365 days)
+/** True when the field carries an expiry that has already elapsed. Never reads plaintext. */
+export function isExpired(f: Field): boolean {
+  return f.expiresAt !== undefined && Date.now() >= f.expiresAt;
+}
+/** True when a draw failure was caused by expiry rather than a missing secret. */
+export function isExpiryError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("secret expired: ");
+}
+
+function resolveExpiry(opts?: { ttlMs?: number; expiresAt?: number }): number | undefined {
+  const ttlMs = opts?.ttlMs;
+  const expiresAt = opts?.expiresAt;
+  if (ttlMs !== undefined && expiresAt !== undefined) throw new Error("specify either ttlMs or expiresAt, not both");
+  if (ttlMs !== undefined) {
+    if (!Number.isInteger(ttlMs) || ttlMs < MIN_TTL_MS || ttlMs > MAX_TTL_MS) {
+      throw new Error(`invalid ttlMs: expected an integer from ${MIN_TTL_MS} to ${MAX_TTL_MS} (1 second .. 1 year)`);
+    }
+    return Date.now() + ttlMs;
+  }
+  if (expiresAt !== undefined) {
+    if (!Number.isInteger(expiresAt)) throw new Error("invalid expiresAt: expected an integer epoch timestamp in milliseconds");
+    const now = Date.now();
+    if (expiresAt <= now) throw new Error("invalid expiresAt: must be in the future");
+    if (expiresAt - now > MAX_TTL_MS) throw new Error(`invalid expiresAt: at most 1 year (${MAX_TTL_MS} ms) from now`);
+    return expiresAt;
+  }
+  return undefined; // no expiry supplied: the credential becomes permanent again
+}
+
+export function putSecret(id: string, field: string, plaintext: string, opts?: { cls?: Class; mask?: string; tags?: string[]; ttlMs?: number; expiresAt?: number }) {
   validateKey(id, "id");
   validateKey(field, "field");
   if (typeof plaintext !== "string" || !plaintext.length || Buffer.byteLength(plaintext, "utf8") > 1024 * 1024) {
@@ -114,15 +146,19 @@ export function putSecret(id: string, field: string, plaintext: string, opts?: {
     Array.from(opts.tags).some((tag) => typeof tag !== "string" || !tag.trim() || tag.length > 128 || /[\u0000-\u001f\u007f]/u.test(tag)))) {
     throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
   }
+  const expiresAt = resolveExpiry(opts);
   const key = getMasterKey();
   const s = loadStore();
   if (!hasOwn(s.entries, id)) s.entries[id] = { id, type: id.startsWith("person:") ? "person" : "credential", fields: Object.create(null) };
   const cls = opts?.cls ?? (id.startsWith("person:") ? "pii" : "credential");
-  s.entries[id].fields[field] = {
+  const stored: Field = {
     value: encrypt(key, Buffer.from(plaintext, "utf8")),
     class: cls,
     mask: opts?.mask,
   };
+  // An omitted expiry explicitly makes the replacement permanent.
+  if (expiresAt !== undefined) stored.expiresAt = expiresAt;
+  s.entries[id].fields[field] = stored;
   if (opts?.tags) s.entries[id].tags = opts.tags;
   saveStore(s);
 }
@@ -154,6 +190,22 @@ export function getSecret(id: string, field: string): string {
   return Buffer.from(decrypt(key, f.value)).toString("utf8");
 }
 
+/**
+ * Draw-path read: identical to getSecret except that an expired field is refused
+ * BEFORE any ciphertext touches the caller. Errors mention "expired".
+ */
+export function getSecretFresh(id: string, field: string): string {
+  validateKey(id, "id");
+  validateKey(field, "field");
+  const key = getMasterKey();
+  const s = loadStore();
+  const entry = hasOwn(s.entries, id) ? s.entries[id] : undefined;
+  const f = entry && hasOwn(entry.fields, field) ? entry.fields[field] : undefined;
+  if (!f) throw new Error(`no such secret: ${id}/${field}`);
+  if (f.expiresAt !== undefined && Date.now() >= f.expiresAt) throw new Error(`secret expired: ${id}/${field}`);
+  return Buffer.from(decrypt(key, f.value)).toString("utf8");
+}
+
 export function mask(plaintext: string, mode?: string): string {
   switch (mode) {
     case "phone":
@@ -175,10 +227,18 @@ export function mask(plaintext: string, mode?: string): string {
 /** Descriptor: everything an agent is allowed to see. Never contains plaintext. */
 export type Descriptor = {
   ref: string;
-  fields: { name: string; class: Class; mask?: string; fingerprint: string }[];
+  fields: { name: string; class: Class; mask?: string; fingerprint: string; expiresAt?: number; expired?: boolean }[];
   recipes: { id: string; channel: string }[];
   tags: string[];
 };
+
+/**
+ * Expiry projection for the agent-visible surfaces: a future expiry, or the flag
+ * that it elapsed. Both keys are omitted for permanent credentials. No plaintext.
+ */
+function expiryProjection(f: Field): { expiresAt?: number; expired?: boolean } {
+  return f.expiresAt === undefined ? {} : { expiresAt: f.expiresAt, expired: Date.now() >= f.expiresAt };
+}
 
 const BUILTIN_RECIPES = [
   {id:'env',channel:'A1/exec'}, {id:'fd',channel:'A2/fd'},
@@ -200,6 +260,7 @@ export function listDescriptors(filter?: { tag?: string }): Descriptor[] {
         class: f.class,
         mask: f.mask,
         fingerprint: fingerprint(Buffer.from(decrypt(key, f.value)).toString("utf8")),
+        ...expiryProjection(f),
       })),
       recipes: availableRecipes(e),
       tags: e.tags ?? [],
@@ -217,7 +278,7 @@ export function describe(id: string): Descriptor & { maskedPreview: Record<strin
   for (const [name, f] of Object.entries(e.fields)) {
     const pt = Buffer.from(decrypt(key, f.value)).toString("utf8");
     masked[name] = f.class === "credential" ? "****" : mask(pt, f.mask);
-    fields.push({ name, class: f.class, mask: f.mask, fingerprint: fingerprint(pt) });
+    fields.push({ name, class: f.class, mask: f.mask, fingerprint: fingerprint(pt), ...expiryProjection(f) });
   }
   return {
     ref: `secret://${e.id}`,

@@ -4,12 +4,12 @@
 ///   MCP server gets an admin token via WELLSPRING_ADMIN_TOKEN at spawn time
 ///   (trusted host = whoever spawned us). One-shot exec tokens are issued by
 ///   `wellspring exec` via the CLI's admin token, and burn on first use.
-import { createServer, Socket } from "node:net";
+import { createServer, connect, Socket } from "node:net";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { listDescriptors, describe, getSecret, putSecret, deleteSecret, mask, fingerprint } from "../core/store.ts";
+import { listDescriptors, describe, getSecret, getSecretFresh, putSecret, deleteSecret, mask, fingerprint, isExpiryError } from "../core/store.ts";
 
 export const WS_HOME = process.env.WELLSPRING_HOME ?? join(homedir(), ".wellspring");
 export const SOCK_PATH = process.env.WELLSPRING_SOCK ?? join(WS_HOME, "wellspringd.sock");
@@ -96,12 +96,27 @@ type DrawEvent = {
   field: string;
   channel: string;
   reason?: string;
-  verdict: "ok" | "denied_rate" | "denied_reason" | "denied_auth" | "error";
+  verdict: "ok" | "denied_rate" | "denied_reason" | "denied_auth" | "expired" | "error";
 };
 
 function logDraw(e: DrawEvent) {
   mkdirSync(WS_HOME, { recursive: true });
   appendFileSync(AUDIT_PATH, JSON.stringify(e) + "\n");
+}
+
+/**
+ * Shared read for every draw path. A refused draw yields NO plaintext to the
+ * caller: the expiry check runs before decryption and we return {error} only.
+ * Other failures (unknown ref) propagate for the existing error handling.
+ */
+function drawFresh(base: Omit<DrawEvent, "verdict" | "ts">): { value: string } | { error: string } {
+  try {
+    return { value: getSecretFresh(base.entry, base.field) };
+  } catch (error) {
+    if (!isExpiryError(error)) throw error;
+    logDraw({ ...base, ts: Date.now(), verdict: "expired" });
+    return { error: `secret expired: ${base.entry}/${base.field}` };
+  }
 }
 
 function parseRef(ref: string): [string, string] {
@@ -135,7 +150,8 @@ export function handle(msg: any): any {
     }
     case "put": {
       if (burnToken(msg) !== "admin") return { error: "unauthorized" };
-      putSecret(msg.id, msg.field, msg.value, { cls: msg.cls, mask: msg.mask, tags: msg.tags });
+      // Rotation replaces the value without reading it, including when it has expired.
+      putSecret(msg.id, msg.field, msg.value, { cls: msg.cls, mask: msg.mask, tags: msg.tags, ttlMs: msg.ttlMs, expiresAt: msg.expiresAt });
       logDraw({ ts: Date.now(), op: "put", entry: msg.id, field: msg.field, channel: "admin", verdict: "ok" });
       return { ok: true };
     }
@@ -174,9 +190,11 @@ export function handle(msg: any): any {
         logDraw({ ts: Date.now(), op: "resolve", entry: msg.id, field: msg.field, channel: "resolve", reason: msg.reason, verdict: "denied_rate" });
         return { error: "rate limited" };
       }
-      const pt = getSecret(msg.id, msg.field);
+      // Expiry is checked last so an unauthenticated caller learns nothing new.
+      const drawn = drawFresh({ op: "resolve", entry: msg.id, field: msg.field, channel: "resolve", reason: msg.reason });
+      if ("error" in drawn) return drawn;
       logDraw({ ts: Date.now(), op: "resolve", entry: msg.id, field: msg.field, channel: "resolve", reason: msg.reason, verdict: "ok" });
-      return { value: pt };
+      return { value: drawn.value };
     }
     case "draw_env": {
       // A1 channel: requires admin OR one-shot token.
@@ -185,12 +203,17 @@ export function handle(msg: any): any {
         logDraw({ ts: Date.now(), op: "draw_env", entry: "*", field: "*", channel: "A1/exec", verdict: "denied_auth" });
         return { error: "unauthorized" };
       }
+      // Fail closed: draw every ref first, so an expiry never ships a partial env.
       const env: Record<string, string> = {};
+      const failures: string[] = [];
       for (const [varName, ref] of Object.entries(msg.env ?? {})) {
         const [id, field] = parseRef(ref as string);
-        env[varName] = getSecret(id, field);
+        const drawn = drawFresh({ op: "draw_env", entry: id, field, channel: "A1/exec" });
+        if ("error" in drawn) { failures.push(drawn.error); continue; }
+        env[varName] = drawn.value;
         logDraw({ ts: Date.now(), op: "draw_env", entry: id, field, channel: "A1/exec", verdict: "ok" });
       }
+      if (failures.length) return { error: failures[0] };
       return { env };
     }
     case "draw": {
@@ -201,15 +224,36 @@ export function handle(msg: any): any {
         return { error: "unauthorized" };
       }
       const [id, field] = parseRef(msg.ref);
-      const value = getSecret(id, field);
+      const drawn = drawFresh({ op: "draw", entry: id, field, channel: msg.channel ?? "A2/fd" });
+      if ("error" in drawn) return drawn;
       logDraw({ ts: Date.now(), op: "draw", entry: id, field, channel: msg.channel ?? "A2/fd", verdict: "ok" });
-      return { value };
+      return { value: drawn.value };
     }
     case "audit":
       return { events: existsSync(AUDIT_PATH) ? readFileSync(AUDIT_PATH, "utf8").trim().split("\n") : [] };
     default:
       return { error: `unknown op: ${msg.op}` };
   }
+}
+
+// A killed or crashed daemon leaves its socket file behind. The file still looks
+// present but every connect fails with ENOENT, so the MCP server reports a
+// confusing "ENOENT" instead of "the daemon is not running". Probe first.
+function probeLive(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = connect(path);
+    const done = (live: boolean) => { sock.destroy(); resolve(live); };
+    sock.once("connect", () => done(true));
+    sock.once("error", () => done(false));
+  });
+}
+
+async function ensureSocketFree(path: string) {
+  if (!(await probeLive(path))) {
+    try { rmSync(path); } catch (e: any) { if (e?.code !== "ENOENT") throw e; }
+    return;
+  }
+  throw new Error(`another wellspringd is already listening on ${path} — stop it first, or start this one with a different WELLSPRING_SOCK`);
 }
 
 if (import.meta.main) {
@@ -232,7 +276,13 @@ if (import.meta.main) {
       }
     });
   });
-  server.listen(SOCK_PATH, () => console.log(`wellspringd listening on ${SOCK_PATH}`));
+  server.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "EADDRINUSE") return;
+    console.error(`wellspringd failed to listen on ${SOCK_PATH}: ${error.message}`);
+  });
+  // The Web UI is a convenience; the credential socket is the product.
+  ensureSocketFree(SOCK_PATH).then(() => { server.listen(SOCK_PATH, () => console.log(`wellspringd listening on ${SOCK_PATH}`)); })
+    .catch((error) => { console.error(String(error?.message ?? error)); process.exit(1); });
   // Web UI + HTTP API on loopback (human-facing admin console)
   import("./web.ts").then((m) => m.startHttp()).catch((e) => console.error("web ui failed:", e?.message));
 }

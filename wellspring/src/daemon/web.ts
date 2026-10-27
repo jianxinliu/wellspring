@@ -112,7 +112,7 @@ const HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wellspring · 凭证井</title>
 <style>
-  :root { --bg:#0f1419; --card:#1a222c; --line:#2a3644; --fg:#e8eef4; --dim:#8fa3b3; --accent:#4fc3f7; --red:#ef5350; --orange:#ffa726; --green:#66bb6a; }
+  :root { --bg:#0f1419; --card:#1a222c; --line:#2a3644; --fg:#e8eef4; --dim:#8fa3b3; --accent:#4fc3f7; --red:#ef5350; --orange:#ffa726; --green:#66bb6a; --violet:#b388ff; }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--fg); font:14px/1.6 ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
   header { display:flex; align-items:center; gap:14px; padding:14px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5; }
@@ -132,6 +132,7 @@ const HTML = `<!doctype html>
   .b-ok { background:rgba(102,187,106,.15); color:var(--green); }
   .b-denied { background:rgba(239,83,80,.15); color:var(--red); }
   .b-warn { background:rgba(255,167,38,.15); color:var(--orange); }
+  .b-expired { background:rgba(179,136,255,.16); color:var(--violet); }
   .b-cred { background:rgba(79,195,247,.12); color:var(--accent); }
   .b-pii { background:rgba(255,167,38,.12); color:var(--orange); }
   .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--dim); }
@@ -232,7 +233,24 @@ function verdictBadge(v) {
   if (v === "denied_auth") return '<span class="badge b-denied">denied·auth</span>';
   if (v === "denied_reason") return '<span class="badge b-warn">denied·reason</span>';
   if (v === "denied_rate") return '<span class="badge b-warn">denied·rate</span>';
+  if (v === "expired") return '<span class="badge b-expired">expired</span>';
   return '<span class="badge b-denied">' + esc(v) + "</span>";
+}
+function fmtDuration(ms) {
+  if (ms <= 0) return "已过期";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + " 秒后过期";
+  const m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+  if (d > 0) return d + " 天后过期";
+  if (h > 0) return h + " 小时后过期";
+  return m + " 分钟后过期";
+}
+// Remaining lifetime badge; empty when the credential never expires. No plaintext involved.
+function expiryBadge(f) {
+  if (typeof f?.expiresAt !== "number") return "";
+  const left = f.expiresAt - Date.now();
+  return '<span class="badge ' + (left <= 0 ? "b-expired" : "b-warn") + '" title="' + esc(fmtTs(f.expiresAt)) + '">' +
+    esc(fmtDuration(left)) + "</span>";
 }
 
 // ---------- vault ----------
@@ -248,7 +266,7 @@ function drawVault() {
   const rows = S.entries.filter((e) => !q || e.id.toLowerCase().includes(q) || e.fields.some((f) => f.name.includes(q)));
   const el = document.getElementById("vault-tbl");
   if (!rows.length) { el.innerHTML = '<div class="empty">（空 · 用 CLI put 或下方表单添加）</div>'; return; }
-  el.innerHTML = "<table><tr><th>条目</th><th>字段</th><th>类型</th><th>指纹</th><th>保护状态</th><th>标签</th><th>操作</th></tr>" +
+  el.innerHTML = "<table><tr><th>条目</th><th>字段</th><th>类型</th><th>指纹</th><th>保护状态</th><th>有效期</th><th>标签</th><th>操作</th></tr>" +
     rows.map((e) => {
       const cls = e.id.startsWith("person:") ? "b-pii" : "b-cred";
       return e.fields.map((f, i) =>
@@ -257,6 +275,7 @@ function drawVault() {
         "<td>" + esc(f.name) + "</td><td>" + esc(f.class ?? "credential") + "</td>" +
         '<td class="mono">' + esc(f.fingerprint ?? "") + "</td>" +
         '<td class="mono">' + esc(e.maskedPreview?.[f.name] ?? "****") + "</td>" +
+        "<td>" + expiryBadge(f) + "</td>" +
         (i === 0 ? '<td rowspan="' + e.fields.length + '">' + (e.tags ?? []).map(esc).join(", ") + "</td>" : "") +
         '<td><button class="usage-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '" aria-expanded="false">使用</button> <button class="edit-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">轮换</button> <button class="danger delete-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">删除字段</button>' + (i === 0 ? ' <button class="danger delete-entry" data-entry="' + S.entries.indexOf(e) + '">删除条目</button>' : '') + '</td></tr>'
       ).join("");
@@ -289,7 +308,7 @@ function showUsage(button) {
     ['MCP · tools/call JSON', JSON.stringify({name:'wellspring_exec',arguments:{env:{APP_SECRET:ref},command:['<program>','<arg>'],output:'none'}}, null, 2)],
   ];
   const row = document.createElement('tr'); row.id = 'usage-panel';
-  const cell = document.createElement('td'); cell.colSpan = 7; cell.className = 'usage-panel';
+  const cell = document.createElement('td'); cell.colSpan = 8; cell.className = 'usage-panel';
   const heading = document.createElement('h3'); heading.textContent = '使用 ' + entry.id + '/' + field.name; cell.appendChild(heading);
   const note = document.createElement('p');
   note.textContent = '仅展示引用，不读取明文。替换占位 argv，选择可信程序且不要打印秘密。FD 号由 WELLSPRING_FD_APP_SECRET 提供；APP_SECRET_FILE 是自动清理的临时文件路径。Git 使用一次性 askpass；MCP 示例默认不返回输出。';
@@ -324,7 +343,8 @@ function showAdd(index, fieldIndex) {
     '<b>值</b><input id="f-val" type="password" placeholder="明文（仅写入加密存储）">' +
     '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
     '<b>标签</b><input id="f-tags" placeholder="逗号分隔，如 production, github">' +
-    '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select><b>脱敏说明</b><span id="f-mask-note">选择保存时使用的脱敏方式。</span></div>' +
+    '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select><b>脱敏说明</b><span id="f-mask-note">选择保存时使用的脱敏方式。</span>' +
+    '<b>有效期</b><select id="f-ttl"><option value="">从不（永久有效）</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select><b>有效期说明</b><span id="f-ttl-note">设置后到期即拒绝出水，需人工轮换。</span></div>' +
     '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>');
   if (entry) {
     document.querySelector('#add-form h2').textContent = '轮换字段（原值不会被读取）';
@@ -344,6 +364,19 @@ function showAdd(index, fieldIndex) {
       select.add(new Option('请选择脱敏方式', ''), 0); select.value='';
       document.getElementById('f-mask-note').textContent='描述符未提供原脱敏方式，无法自动保留；请明确选择轮换后的方式。标签保持不变。';
     }
+    // Rotation must not silently wipe an existing expiry: default the selector to
+    // "keep current" and only send ttlMs when the operator actively picks one.
+    const ttlNote = document.getElementById('f-ttl-note');
+    const ttlSelect = document.getElementById('f-ttl');
+    if (typeof field.expiresAt === 'number') {
+      const current = field.expiresAt > Date.now() ? 'keep' : 'choose';
+      ttlSelect.add(new Option(current === 'keep' ? '保持当前（' + fmtDuration(field.expiresAt - Date.now()) + '）' : '已过期，请选择新的有效期', current), 0);
+      ttlSelect.value = current;
+      ttlSelect.dataset.expiresAt = String(field.expiresAt);
+      ttlNote.textContent = '当前到期时间：' + fmtTs(field.expiresAt) + '。选择具体时长则从现在重新计时。';
+    } else {
+      ttlNote.textContent = '该字段当前无有效期。不选择则轮换后仍为永久有效。';
+    }
   }
   document.getElementById('f-val').focus();
 }
@@ -356,6 +389,11 @@ async function addPut() {
       ? JSON.parse(document.getElementById('add-form').dataset.tags)
       : document.getElementById('f-tags').value.split(',').map(s => s.trim()).filter(Boolean),
   };
+  const ttlSelect = document.getElementById('f-ttl');
+  const ttl = ttlSelect.value;
+  if (ttl === 'choose') { notify('请选择轮换后的有效期', true); return; }
+  if (ttl === 'keep') body.expiresAt = Number(ttlSelect.dataset.expiresAt);
+  else if (ttl) body.ttlMs = Number(ttl);
   if (!body.id.trim() || !body.value) { notify('请填写条目 ID 和值', true); return; }
   if (!body.mask) { notify('请明确选择脱敏方式后保存', true); return; }
   const r = await api("put", body);
@@ -412,6 +450,7 @@ async function renderStats() {
   const admin = evs.filter(e => !['draw', 'draw_env', 'resolve'].includes(e.op) && e.verdict === 'ok');
   const denied = evs.filter((e) => e.verdict.startsWith('denied_'));
   const errors = evs.filter(e => e.verdict === 'error');
+  const expired = evs.filter(e => e.verdict === 'expired');
   const byOp = Object.create(null), byEntry = Object.create(null), byChannel = Object.create(null);
   for (const e of evs) { byOp[e.op] = (byOp[e.op] ?? 0) + 1; byChannel[e.channel] = (byChannel[e.channel] ?? 0) + 1; }
   for (const e of ok) byEntry[e.entry] = (byEntry[e.entry] ?? 0) + 1;
@@ -425,6 +464,7 @@ async function renderStats() {
     '<div class="stat"><div class="num">' + admin.length + '</div><div class="lbl">成功管理操作</div></div>' +
     '<div class="stat"><div class="num" style="color:var(--red)">' + denied.length + '</div><div class="lbl">被拒绝</div></div>' +
     '<div class="stat"><div class="num" style="color:var(--orange)">' + errors.length + '</div><div class="lbl">操作错误</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--violet)">' + expired.length + '</div><div class="lbl">已过期拒绝</div></div>' +
     '<div class="stat"><div class="num">' + S.entries.length + '</div><div class="lbl">凭据条目</div></div>' +
     '</div>' +
     '<div class="card"><h2>按条目成功出水频次</h2>' + top(byEntry).map(([k, v]) =>
