@@ -267,7 +267,7 @@ function drawVault() {
   const q = (document.getElementById("q")?.value ?? "").toLowerCase();
   const rows = S.entries.filter((e) => !q || e.id.toLowerCase().includes(q) || e.fields.some((f) => f.name.includes(q)));
   const el = document.getElementById("vault-tbl");
-  if (!rows.length) { el.innerHTML = '<div class="empty">（空 · 用 CLI put 或下方表单添加）</div>'; return; }
+  if (!rows.length) { el.innerHTML = '<div class="empty">还没有凭据 · 点右上角「＋ 新增凭据」，填名称和值即可</div>'; return; }
   el.innerHTML = "<table><tr><th>条目</th><th>字段</th><th>类型</th><th>指纹</th><th>保护状态</th><th>有效期</th><th>标签</th><th>操作</th></tr>" +
     rows.map((e) => {
       const cls = e.id.startsWith("person:") ? "b-pii" : "b-cred";
@@ -336,41 +336,79 @@ async function deleteEntry(index, fieldIndex) {
   await api('delete', {id:entry.id, field});
   notify('已删除'); await renderVault();
 }
+// Sensible defaults per common secret kind: one click instead of six fields.
+// mask "none" is right for machine credentials (a mask there would be noise) and
+// "phone"/"keep1" is right for personal data.
+const QUICK_KINDS = [
+  { label: "API Key", id: "cred:api_key" },
+  { label: "数据库密码", id: "cred:db_prod", field: "password" },
+  { label: "GitHub Token", id: "cred:github_pat" },
+  { label: "SSH 私钥", id: "cred:ssh_key", mask: "none" },
+  { label: "签名密钥", id: "cred:sign_key", field: "key" },
+  { label: "手机号", id: "person:contact", field: "phone", cls: "pii", mask: "phone" },
+];
+// Rotation has to know which entry and field it is rewriting; creation does not.
 function showAdd(index, fieldIndex) {
   document.getElementById('add-form')?.remove();
   const entry = index === undefined ? undefined : S.entries[index];
   const field = entry?.fields[fieldIndex];
   const app = document.getElementById("app");
+  // Two steps only when creating: name + value. Everything else is a default that
+  // can be changed under 高级选项. Rotation keeps the stricter checked fields.
   app.insertAdjacentHTML("afterbegin",
-    '<div class="card" id="add-form"><h2>新增凭据</h2>' +
-    '<div class="kv"><b>id</b><input id="f-id" placeholder="cred:github_pat / person:zhang_san">' +
-    '<b>字段名</b><input id="f-field" placeholder="value / password / phone">' +
-    '<b>值</b><input id="f-val" type="password" placeholder="明文（仅写入加密存储）">' +
-    '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
-    '<b>标签</b><input id="f-tags" placeholder="逗号分隔，如 production, github">' +
-    '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select><b>脱敏说明</b><span id="f-mask-note">选择保存时使用的脱敏方式。</span>' +
-    '<b>有效期</b><select id="f-ttl"><option value="">从不（永久有效）</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select><b>有效期说明</b><span id="f-ttl-note">设置后到期即拒绝出水，需人工轮换。</span></div>' +
-    '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>');
+    entry
+      ? '<div class="card" id="add-form"><h2>轮换字段（原值不会被读取）</h2>' +
+        '<div class="kv"><b>条目</b><span class="mono">' + esc(entry.id) + '</span>' +
+        '<b>字段名</b><span class="mono">' + esc(field.name) + '</span>' +
+        '<b>新值</b><input id="f-val" type="password" placeholder="新的明文（仅写入加密存储）" autocomplete="new-password">' +
+        '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
+        '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select>' +
+        '<b>脱敏说明</b><span id="f-mask-note">选择保存时使用的脱敏方式。</span>' +
+        '<b>有效期</b><select id="f-ttl"><option value="">保持当前</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select>' +
+        '<b>有效期说明</b><span id="f-ttl-note">设置后到期即拒绝出水，需人工轮换。</span></div>' +
+        '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存新值</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>'
+      : '<div class="card" id="add-form"><h2>新增凭据</h2>' +
+        '<p style="color:var(--dim);font-size:12px;margin-bottom:12px">只需填名称和值，其余自动设置。想用现成名字就点下面的快捷类型。</p>' +
+        '<div class="row" id="quick-kinds"></div>' +
+        '<div class="kv"><b>名称</b><input id="f-id" placeholder="随便起名，如 github_token（自动加 cred: 前缀）">' +
+        '<b>值</b><input id="f-val" type="password" placeholder="粘贴密钥或密码（只进加密存储）" autocomplete="new-password"></div>' +
+        '<div id="f-adv-wrap"><button id="f-adv-toggle" type="button" style="margin-top:12px">高级选项</button>' +
+        '<div id="f-adv" class="kv" style="display:none;margin-top:12px">' +
+        '<b>字段名</b><input id="f-field" placeholder="value / password / phone">' +
+        '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
+        '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select>' +
+        '<b>有效期</b><select id="f-ttl"><option value="">从不（永久有效）</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select>' +
+        '<b>标签</b><input id="f-tags" placeholder="逗号分隔，如 production, github">' +
+        '</div></div>' +
+        '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>');
+  if (!entry) document.getElementById('quick-kinds').innerHTML = QUICK_KINDS.map((k, i) =>
+    '<button type="button" class="quick" data-i="' + i + '">' + esc(k.label) + '</button>').join("");
+  if (!entry) document.querySelectorAll('#add-form .quick').forEach(b => b.onclick = () => applyQuick(Number(b.dataset.i)));
+  if (!entry) document.getElementById('f-adv-toggle').onclick = () => {
+    const box = document.getElementById('f-adv');
+    const open = box.style.display !== 'none';
+    box.style.display = open ? 'none' : 'grid';
+    document.getElementById('f-adv-toggle').textContent = open ? '高级选项' : '收起高级选项';
+  };
   if (entry) {
-    document.querySelector('#add-form h2').textContent = '轮换字段（原值不会被读取）';
-    document.getElementById('f-id').value=entry.id; document.getElementById('f-id').readOnly=true;
-    document.getElementById('f-field').value=field.name; document.getElementById('f-field').readOnly=true;
-    document.getElementById('f-cls').value=field.class;
-    document.getElementById('add-form').dataset.tags=JSON.stringify(entry.tags ?? []);
-    document.getElementById('f-tags').value=(entry.tags ?? []).join(', ');
-    // Tags are entry-wide; retain their exact strings during field rotation.
-    document.getElementById('f-tags').readOnly=true;
+    const form = document.getElementById('add-form');
+    form.dataset.edit = '1';
+    form.dataset.entry = String(index);
+    form.dataset.field = field.name;
+    // Tags are entry-wide and never edited during a field rotation.
+    form.dataset.tags = JSON.stringify(entry.tags ?? []);
+    document.getElementById('f-cls').value = field.class;
     const select = document.getElementById('f-mask');
     if (typeof field.mask === 'string') {
       if (!Array.from(select.options).some(o => o.value === field.mask)) select.add(new Option(field.mask, field.mask));
-      select.value=field.mask;
-      document.getElementById('f-mask-note').textContent='已保留描述符提供的原脱敏方式。';
+      select.value = field.mask;
+      document.getElementById('f-mask-note').textContent = '已保留原脱敏方式。';
     } else {
-      select.add(new Option('请选择脱敏方式', ''), 0); select.value='';
-      document.getElementById('f-mask-note').textContent='描述符未提供原脱敏方式，无法自动保留；请明确选择轮换后的方式。标签保持不变。';
+      select.add(new Option('请选择脱敏方式', ''), 0); select.value = '';
+      document.getElementById('f-mask-note').textContent = '请明确选择轮换后的脱敏方式。';
     }
-    // Rotation must not silently wipe an existing expiry: default the selector to
-    // "keep current" and only send ttlMs when the operator actively picks one.
+    // Rotation must not silently wipe an existing expiry: keep the current window
+    // unless the operator picks a new duration.
     const ttlNote = document.getElementById('f-ttl-note');
     const ttlSelect = document.getElementById('f-ttl');
     if (typeof field.expiresAt === 'number') {
@@ -385,24 +423,52 @@ function showAdd(index, fieldIndex) {
   }
   document.getElementById('f-val').focus();
 }
+function normalizeId(raw, cls) {
+  const name = String(raw ?? "").trim();
+  if (!name) return "";
+  const prefix = cls === "pii" || cls === "pii_high" ? "person:" : "cred:";
+  const typed = /^(cred|person):/i.test(name) ? name : prefix + name;
+  // Separators a human would type are not allowed in refs; normalize instead of rejecting.
+  return typed.replace(/\./g, "_").replace(/\s+/g, "_");
+}
+// Pre-fills the form from a quick kind: name, field, class, mask, and its own tags.
+function applyQuick(i) {
+  const k = QUICK_KINDS[i];
+  document.getElementById('f-id').value = k.id;
+  document.getElementById('f-field').value = k.field ?? 'value';
+  document.getElementById('f-cls').value = k.cls ?? 'credential';
+  document.getElementById('f-mask').value = k.mask ?? 'keep1';
+  document.getElementById('f-val').focus();
+}
 async function addPut() {
+  const form = document.getElementById('add-form');
+  const editing = form.dataset.edit === '1';
+  const entry = editing ? S.entries[Number(form.dataset.entry)] : undefined;
+  const value = document.getElementById("f-val").value;
+  if (!value) { notify('请填写要保存的值', true); return; }
   const body = {
-    id: document.getElementById("f-id").value, field: document.getElementById("f-field").value || "value",
-    value: document.getElementById("f-val").value, cls: document.getElementById("f-cls").value || undefined,
+    // A bare name is prefixed so nobody has to learn the ref syntax up front.
+    id: editing ? entry.id : normalizeId(document.getElementById("f-id").value, document.getElementById('f-cls').value),
+    field: editing ? form.dataset.field : (document.getElementById("f-field").value || "value"),
+    value, cls: document.getElementById("f-cls").value || undefined,
     mask: document.getElementById("f-mask").value,
-    tags: document.getElementById('add-form').dataset.tags !== undefined
-      ? JSON.parse(document.getElementById('add-form').dataset.tags)
+    tags: form.dataset.tags !== undefined
+      ? JSON.parse(form.dataset.tags)
       : document.getElementById('f-tags').value.split(',').map(s => s.trim()).filter(Boolean),
   };
+  if (!body.id) { notify('请填写名称', true); return; }
   const ttlSelect = document.getElementById('f-ttl');
   const ttl = ttlSelect.value;
   if (ttl === 'choose') { notify('请选择轮换后的有效期', true); return; }
   if (ttl === 'keep') body.expiresAt = Number(ttlSelect.dataset.expiresAt);
   else if (ttl) body.ttlMs = Number(ttl);
-  if (!body.id.trim() || !body.value) { notify('请填写条目 ID 和值', true); return; }
   if (!body.mask) { notify('请明确选择脱敏方式后保存', true); return; }
   const r = await api("put", body);
-  if (r.ok) { document.getElementById('f-val').value=''; document.getElementById("add-form").remove(); notify('已加密保存'); renderVault(); }
+  if (r.ok) {
+    if (editing) notify('已轮换并加密保存');
+    else notify('已保存 ' + body.id + (body.ttlMs ? '（' + fmtDuration(body.ttlMs) + '）' : ''));
+    form.remove(); renderVault();
+  }
 }
 
 async function renderPolicy() {
