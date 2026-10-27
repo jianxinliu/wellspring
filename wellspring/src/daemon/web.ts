@@ -88,6 +88,13 @@ export function startHttp(preferred = HTTP_PORT) {
       }
     }
 
+    // ---- favicon ----
+    // Inlined so the console keeps its mark when served from a single daemon file.
+    if (path === "/favicon.svg" || path === "/favicon.ico") {
+      res.writeHead(200, { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "public, max-age=86400" });
+      return res.end(FAVICON);
+    }
+
     // ---- UI ----
     if (path === "/" || path === "/index.html") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -107,11 +114,21 @@ export function startHttp(preferred = HTTP_PORT) {
   return server;
 }
 
+// Favicon: broken ring (the well mouth) + falling droplet. Colours match the UI accent.
+const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Wellspring">
+<rect width="64" height="64" rx="14" fill="#0f1419"/>
+<circle cx="32" cy="32" r="19" fill="none" stroke="#4fc3f7" stroke-width="5" stroke-linecap="round" stroke-dasharray="84 36" transform="rotate(-58 32 32)"/>
+<path d="M32 16c5.5 7.4 9 12.4 9 16.6A9 9 0 0 1 23 32.6C23 28.4 26.5 23.4 32 16z" fill="#4fc3f7"/>
+<circle cx="32" cy="33" r="3" fill="#0f1419"/>
+</svg>
+`;
+
 const HTML = `<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Wellspring · 凭证井</title>
 <style>
   :root { --bg:#0f1419; --card:#1a222c; --line:#2a3644; --fg:#e8eef4; --dim:#8fa3b3; --accent:#4fc3f7; --red:#ef5350; --orange:#ffa726; --green:#66bb6a; --violet:#b388ff; }
@@ -149,6 +166,7 @@ const HTML = `<!doctype html>
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
   #login { max-width:420px; margin:80px auto; text-align:center; }
   #login .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+  .card .hint { color:var(--dim); font-size:12px; margin:2px 0 12px; }
   .bar { height:8px; border-radius:4px; background:var(--line); overflow:hidden; margin-top:4px; }
   .bar > div { height:100%; background:var(--accent); }
   .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 16px; font-size:13px; }
@@ -165,21 +183,21 @@ const HTML = `<!doctype html>
 </head>
 <body>
 <div id="login" class="card" style="display:none">
-  <h2>🔐 Wellspring 管理台</h2>
-  <p style="color:var(--dim);font-size:13px">本地守护进程凭证井 · 请输入 admin token</p>
+  <h2>💧 Wellspring 管理台</h2>
+  <p style="color:var(--dim);font-size:13px">需要 admin token 才能进入</p>
   <div class="row" style="justify-content:center;margin-top:16px">
-    <input id="tok-in" type="password" placeholder="admin token" style="width:240px" />
+    <input id="tok-in" type="password" placeholder="粘贴 admin token" style="width:240px" />
     <button onclick="login()" style="padding:6px 18px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#08121a;cursor:pointer">进入</button>
   </div>
-  <p class="hint">token 文件位于 ~/.wellspring/admin.token (0600)</p>
+  <p class="hint">token 在 ~/.wellspring/admin.token（仅本用户可读）。可执行 cat 查看后粘贴。</p>
 </div>
 <header id="appbar" style="display:none">
-  <h1>💧 Wellspring <span>· 凭证井</span></h1>
+  <h1><img src="/favicon.svg" alt="" width="22" height="22" style="vertical-align:-4px;margin-right:8px">Wellspring <span>· 凭证井</span></h1>
   <nav>
     <button id="tab-vault" onclick="show('vault')">凭据库</button>
-    <button id="tab-audit" onclick="show('audit')">审计流水</button>
-    <button id="tab-stats" onclick="show('stats')">用量统计</button>
-    <button id="tab-policy" onclick="show('policy')">访问策略</button>
+    <button id="tab-audit" onclick="show('audit')">使用记录</button>
+    <button id="tab-stats" onclick="show('stats')">概览</button>
+    <button id="tab-policy" onclick="show('policy')">设置</button>
     <button onclick="logout()">退出</button>
   </nav>
 </header>
@@ -202,14 +220,14 @@ function notify(message, failed = false) {
   if (!el) { el = document.createElement('div'); el.id='notice'; el.className='notice'; el.setAttribute('role','status'); document.body.appendChild(el); }
   el.textContent = message; el.style.color = failed ? 'var(--red)' : 'var(--green)';
 }
-window.addEventListener('unhandledrejection', e => { e.preventDefault(); notify(e.reason?.message ?? '操作失败，请重试', true); });
+window.addEventListener('unhandledrejection', e => { e.preventDefault(); notify(e.reason?.message ?? '没有完成，原因未知', true); });
 
 function login() {
   S.token = document.getElementById("tok-in").value.trim();
   api("auth_check").then((r) => {
     if (r.ok) { sessionStorage.wst = S.token; enter(); }
-    else notify("token 无效", true);
-  }).catch(() => notify('登录失败，请检查 token 或服务连接', true));
+    else notify("token 不对", true);
+  }).catch(() => notify('连不上本地服务，确认 wellspringd 还在运行', true));
 }
 function logout() { sessionStorage.removeItem("wst"); location.reload(); }
 function enter() {
@@ -231,11 +249,11 @@ function show(tab) {
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 function fmtTs(ts) { return new Date(ts).toLocaleString("zh-CN", { hour12: false }); }
 function verdictBadge(v) {
-  if (v === "ok") return '<span class="badge b-ok">ok</span>';
-  if (v === "denied_auth") return '<span class="badge b-denied">denied·auth</span>';
-  if (v === "denied_reason") return '<span class="badge b-warn">denied·reason</span>';
-  if (v === "denied_rate") return '<span class="badge b-warn">denied·rate</span>';
-  if (v === "expired") return '<span class="badge b-expired">expired</span>';
+  if (v === "ok") return '<span class="badge b-ok">成功</span>';
+  if (v === "denied_auth") return '<span class="badge b-denied">没带 token</span>';
+  if (v === "denied_reason") return '<span class="badge b-warn">原因不允许</span>';
+  if (v === "denied_rate") return '<span class="badge b-warn">太快了</span>';
+  if (v === "expired") return '<span class="badge b-expired">已过期</span>';
   return '<span class="badge b-denied">' + esc(v) + "</span>";
 }
 function fmtDuration(ms) {
@@ -251,6 +269,7 @@ function fmtDuration(ms) {
 function expiryBadge(f) {
   if (typeof f?.expiresAt !== "number") return "";
   const left = f.expiresAt - Date.now();
+  // Right-aligned inside the cell so the countdown line doesn't jump as digits change.
   return '<span class="badge ' + (left <= 0 ? "b-expired" : "b-warn") + '" title="' + esc(fmtTs(f.expiresAt)) + '">' +
     esc(fmtDuration(left)) + "</span>";
 }
@@ -258,7 +277,7 @@ function expiryBadge(f) {
 // ---------- vault ----------
 async function renderVault() {
   const app = document.getElementById("app");
-  app.innerHTML = '<div class="card"><div class="row"><input id="q" placeholder="搜索 id / 字段…" style="flex:1" oninput="drawVault()"><button onclick="showAdd()">＋ 新增凭据</button></div><div id="vault-tbl"></div></div>';
+  app.innerHTML = '<div class="card"><div class="row"><input id="q" placeholder="按名称或字段过滤" style="flex:1" oninput="drawVault()"><button onclick="showAdd()">＋ 新增凭据</button></div><div id="vault-tbl"></div></div>';
   const r = await api("list");
   S.entries = (r.descriptors ?? []).map(e => ({ ...e, id: e.ref.slice('secret://'.length) }));
   drawVault();
@@ -267,7 +286,7 @@ function drawVault() {
   const q = (document.getElementById("q")?.value ?? "").toLowerCase();
   const rows = S.entries.filter((e) => !q || e.id.toLowerCase().includes(q) || e.fields.some((f) => f.name.includes(q)));
   const el = document.getElementById("vault-tbl");
-  if (!rows.length) { el.innerHTML = '<div class="empty">还没有凭据 · 点右上角「＋ 新增凭据」，填名称和值即可</div>'; return; }
+  if (!rows.length) { el.innerHTML = '<div class="empty">这里还是空的。点「＋ 新增凭据」，填名称和值就行。</div>'; return; }
   el.innerHTML = "<table><tr><th>条目</th><th>字段</th><th>类型</th><th>指纹</th><th>保护状态</th><th>有效期</th><th>标签</th><th>操作</th></tr>" +
     rows.map((e) => {
       const cls = e.id.startsWith("person:") ? "b-pii" : "b-cred";
@@ -299,32 +318,32 @@ function showUsage(button) {
   // POSIX quoting keeps even punctuation in user-supplied refs literal.
   const quote = value => "'" + value.split("'").join("'" + String.fromCharCode(92) + "''") + "'";
   const examples = [
-    ['安全引用', ref],
-    ['CLI · 环境变量', 'wellspring exec --secret ' + quote('APP_SECRET=' + ref) + " -- '<program>' '<arg>'"],
-    ['CLI · 文件描述符', 'wellspring exec --secret-fd ' + quote('APP_SECRET=' + ref) + " -- '<program>' '<arg>'"],
-    ['CLI · 临时文件', 'wellspring exec --secret-file ' + quote('APP_SECRET_FILE=' + ref) + " -- '<program>' '<arg>'"],
-    ['CLI · Git askpass', 'wellspring exec --git-cred ' + quote(ref) + " -- git ls-remote 'https://<host>/<repo>.git'"],
-    ['配置模板内容（JSON）', '{"secret": {{' + ref + ' | json}}}'],
-    ['CLI · 模板配置', "wellspring exec --template-file 'APP_CONFIG=<template-path>' -- '<program>' '<arg>'"],
-    ['MCP · 模板配置', JSON.stringify({name:'wellspring_exec',arguments:{templates:{APP_CONFIG:'{"secret": {{' + ref + ' | json}}}'},command:['<program>','<arg>'],output:'none'}},null,2)],
-    ['MCP · tools/call JSON', JSON.stringify({name:'wellspring_exec',arguments:{env:{APP_SECRET:ref},command:['<program>','<arg>'],output:'none'}}, null, 2)],
-    ['MCP · 短时验证码 TOTP（字段需为 base32 种子）', JSON.stringify({name:'wellspring_derive',arguments:{op:'totp',ref}}, null, 2)],
-    ['MCP · 签名（字段需为 HMAC 密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'hmac',ref,data:'<待签名内容>',alg:'sha256'}}, null, 2)],
-    ['MCP · 加密（字段需为 base64 32 字节密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'encrypt',ref,plaintext:'<明文>'}}, null, 2)],
+    ['引用地址', ref],
+    ['命令行 · 放进环境变量', 'wellspring exec --secret ' + quote('APP_SECRET=' + ref) + " -- '<program>' '<arg>'"],
+    ['命令行 · 从文件描述符读', 'wellspring exec --secret-fd ' + quote('APP_SECRET=' + ref) + " -- '<program>' '<arg>'"],
+    ['命令行 · 写进临时文件', 'wellspring exec --secret-file ' + quote('APP_SECRET_FILE=' + ref) + " -- '<program>' '<arg>'"],
+    ['命令行 · git 凭据', 'wellspring exec --git-cred ' + quote(ref) + " -- git ls-remote 'https://<host>/<repo>.git'"],
+    ['配置文件模板', '{"secret": {{' + ref + ' | json}}}'],
+    ['命令行 · 用模板渲染配置文件', "wellspring exec --template-file 'APP_CONFIG=<template-path>' -- '<program>' '<arg>'"],
+    ['MCP · 模板渲染配置', JSON.stringify({name:'wellspring_exec',arguments:{templates:{APP_CONFIG:'{"secret": {{' + ref + ' | json}}}'},command:['<program>','<arg>'],output:'none'}},null,2)],
+    ['MCP · 注入环境变量', JSON.stringify({name:'wellspring_exec',arguments:{env:{APP_SECRET:ref},command:['<program>','<arg>'],output:'none'}}, null, 2)],
+    ['MCP · 验证码（字段填 base32 种子）', JSON.stringify({name:'wellspring_derive',arguments:{op:'totp',ref}}, null, 2)],
+    ['MCP · 签名（字段填 HMAC 密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'hmac',ref,data:'<待签名内容>',alg:'sha256'}}, null, 2)],
+    ['MCP · 加密（字段填 base64 的 32 字节密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'encrypt',ref,plaintext:'<明文>'}}, null, 2)],
   ];
   const row = document.createElement('tr'); row.id = 'usage-panel';
   const cell = document.createElement('td'); cell.colSpan = 8; cell.className = 'usage-panel';
-  const heading = document.createElement('h3'); heading.textContent = '使用 ' + entry.id + '/' + field.name; cell.appendChild(heading);
+  const heading = document.createElement('h3'); heading.textContent = '怎么用 ' + entry.id + '/' + field.name; cell.appendChild(heading);
   const note = document.createElement('p');
-  note.textContent = '仅展示引用，不读取明文。替换占位 argv，选择可信程序且不要打印秘密。FD 号由 WELLSPRING_FD_APP_SECRET 提供；APP_SECRET_FILE 是自动清理的临时文件路径。Git 使用一次性 askpass；MCP 示例默认不返回输出。';
+  note.textContent = '上面都只是引用地址，不会读出明文。把 <program> 换成你自己的程序，注意别让它把密钥打印出来。文件描述符用 WELLSPRING_FD_APP_SECRET 取号；APP_SECRET_FILE 指向一个退出时自动删除的临时文件。MCP 示例默认不返回程序输出。';
   cell.appendChild(note);
   for (const [label, text] of examples) {
     const title = document.createElement('h4'); title.textContent = label;
     const pre = document.createElement('pre'); pre.textContent = text;
     const copy = document.createElement('button'); copy.textContent = '复制';
     copy.onclick = async () => {
-      try { await navigator.clipboard.writeText(text); notify('已复制引用示例'); }
-      catch { const selection = window.getSelection(); const range = document.createRange(); range.selectNodeContents(pre); selection.removeAllRanges(); selection.addRange(range); notify('请复制已选中的示例', true); }
+      try { await navigator.clipboard.writeText(text); notify('已复制'); }
+      catch { const selection = window.getSelection(); const range = document.createRange(); range.selectNodeContents(pre); selection.removeAllRanges(); selection.addRange(range); notify('浏览器不让直接复制，已帮你选中，按 Cmd+C', true); }
     };
     cell.append(title, pre, copy);
   }
@@ -332,10 +351,9 @@ function showUsage(button) {
 }
 async function deleteEntry(index, fieldIndex) {
   const entry = S.entries[index]; const field = fieldIndex === undefined ? undefined : entry.fields[fieldIndex].name;
-  if (!confirm('确认删除 ' + entry.id + (field ? '/' + field : ' 的全部字段') + '？删除后无法恢复。')) return;
+  if (!confirm('删除 ' + entry.id + (field ? '/' + field : ' 的全部字段') + '？删了就找不回来了。')) return;
   await api('delete', {id:entry.id, field});
-  notify('已删除'); await renderVault();
-}
+  notify('已删除'); await renderVault();}
 // Sensible defaults per common secret kind: one click instead of six fields.
 // mask "none" is right for machine credentials (a mask there would be noise) and
 // "phone"/"keep1" is right for personal data.
@@ -357,28 +375,27 @@ function showAdd(index, fieldIndex) {
   // can be changed under 高级选项. Rotation keeps the stricter checked fields.
   app.insertAdjacentHTML("afterbegin",
     entry
-      ? '<div class="card" id="add-form"><h2>轮换字段（原值不会被读取）</h2>' +
+      ? '<div class="card" id="add-form"><h2>轮换字段</h2><p class="hint">旧值不会被读取，直接用新值覆盖。</p>' +
         '<div class="kv"><b>条目</b><span class="mono">' + esc(entry.id) + '</span>' +
         '<b>字段名</b><span class="mono">' + esc(field.name) + '</span>' +
-        '<b>新值</b><input id="f-val" type="password" placeholder="新的明文（仅写入加密存储）" autocomplete="new-password">' +
+        '<b>新值</b><input id="f-val" type="password" placeholder="新的值" autocomplete="new-password">' +
         '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
         '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select>' +
-        '<b>脱敏说明</b><span id="f-mask-note">选择保存时使用的脱敏方式。</span>' +
+        '<b></b><span id="f-mask-note"></span>' +
         '<b>有效期</b><select id="f-ttl"><option value="">保持当前</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select>' +
-        '<b>有效期说明</b><span id="f-ttl-note">设置后到期即拒绝出水，需人工轮换。</span></div>' +
-        '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存新值</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>'
-      : '<div class="card" id="add-form"><h2>新增凭据</h2>' +
-        '<p style="color:var(--dim);font-size:12px;margin-bottom:12px">只需填名称和值，其余自动设置。想用现成名字就点下面的快捷类型。</p>' +
+        '<b></b><span id="f-ttl-note"></span></div>' +
+        '<div class="row" style="margin-top:12px"><button onclick="addPut()">存新值</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>'
+      : '<div class="card" id="add-form"><h2>新增凭据</h2><p class="hint">填个名字、粘贴值，保存。</p>' +
         '<div class="row" id="quick-kinds"></div>' +
-        '<div class="kv"><b>名称</b><input id="f-id" placeholder="随便起名，如 github_token（自动加 cred: 前缀）">' +
-        '<b>值</b><input id="f-val" type="password" placeholder="粘贴密钥或密码（只进加密存储）" autocomplete="new-password"></div>' +
+        '<div class="kv"><b>名称</b><input id="f-id" placeholder="例如 github_token" autocapitalize="off" autocorrect="off">' +
+        '<b>值</b><input id="f-val" type="password" placeholder="密钥、密码或私钥" autocomplete="new-password"></div>' +
         '<div id="f-adv-wrap"><button id="f-adv-toggle" type="button" style="margin-top:12px">高级选项</button>' +
         '<div id="f-adv" class="kv" style="display:none;margin-top:12px">' +
-        '<b>字段名</b><input id="f-field" placeholder="value / password / phone">' +
+        '<b>字段名</b><input id="f-field" placeholder="默认 value">' +
         '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
         '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select>' +
-        '<b>有效期</b><select id="f-ttl"><option value="">从不（永久有效）</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select>' +
-        '<b>标签</b><input id="f-tags" placeholder="逗号分隔，如 production, github">' +
+        '<b>有效期</b><select id="f-ttl"><option value="">不过期</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select>' +
+        '<b>标签</b><input id="f-tags" placeholder="逗号分隔，例如 production,github">' +
         '</div></div>' +
         '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>');
   if (!entry) document.getElementById('quick-kinds').innerHTML = QUICK_KINDS.map((k, i) =>
@@ -474,7 +491,7 @@ async function addPut() {
 async function renderPolicy() {
   const r = await api('policy_get'); S.policy=r.policy;
   if (!S.policy.exec) S.policy.exec={enabled:false,allow:[],deny:[]};
-  document.getElementById('app').innerHTML='<div class="card"><h2>个人信息访问策略</h2><p>只有白名单中的业务原因能够请求明文解析。限速按字段计算。</p><div class="kv"><label for="p-reasons">允许原因（逗号分隔）</label><input id="p-reasons"><label for="p-rate">每分钟最多解析次数</label><input id="p-rate" type="number" min="1" max="10000"></div></div><div class="card"><h2>访问控制</h2><p>命令规则每行一条，支持引号。* 匹配一个参数，末尾的 ** 匹配任意数量参数；拒绝规则优先。</p><label><input id="p-exec-enabled" type="checkbox"> 启用目标命令白名单</label><div class="kv"><label for="p-exec-allow">允许命令</label><textarea id="p-exec-allow" rows="6" placeholder="node app.js"></textarea><label for="p-exec-deny">拒绝命令</label><textarea id="p-exec-deny" rows="6"></textarea></div><div class="row"><button onclick="savePolicy()">保存策略</button></div></div>';
+  document.getElementById('app').innerHTML='<div class="card"><h2>解析明文的条件</h2><p>只有写了业务原因、且在下面白名单里，才允许取个人信息明文。同一个字段每分钟的次数也有限制。</p><div class="kv"><label for="p-reasons">允许填的原因（逗号分隔）</label><input id="p-reasons"><label for="p-rate">每个字段每分钟最多取几次</label><input id="p-rate" type="number" min="1" max="10000"></div></div><div class="card"><h2>能跑哪些命令</h2><p>一行一条规则，带空格的参数用引号。* 匹配一个参数，末尾的 ** 匹配任意多个；拒绝规则优先。</p><label><input id="p-exec-enabled" type="checkbox"> 启用命令白名单</label><div class="kv"><label for="p-exec-allow">放行</label><textarea id="p-exec-allow" rows="6" placeholder="node app.js"></textarea><label for="p-exec-deny">拦下</label><textarea id="p-exec-deny" rows="6"></textarea></div><div class="row"><button onclick="savePolicy()">保存</button></div></div>';
   document.getElementById('p-reasons').value=r.policy.resolveReasons.join(', ');
   document.getElementById('p-rate').value=r.policy.resolveRatePerMin;
   document.getElementById('p-exec-enabled').checked=S.policy.exec.enabled ?? true;
@@ -484,7 +501,7 @@ async function renderPolicy() {
 async function savePolicy() {
   const lines=id=>document.getElementById(id).value.split('\\n').map(s=>s.trim()).filter(Boolean);
   const policy={...S.policy,resolveReasons:document.getElementById('p-reasons').value.split(',').map(s=>s.trim()).filter(Boolean),resolveRatePerMin:Number(document.getElementById('p-rate').value),exec:{enabled:document.getElementById('p-exec-enabled').checked,allow:lines('p-exec-allow'),deny:lines('p-exec-deny')}};
-  await api('policy_put',{policy}); notify('策略已保存');
+  await api('policy_put',{policy}); notify('已保存');
 }
 
 // ---------- audit ----------
@@ -500,7 +517,7 @@ function parseAudit(lines) {
 }
 async function renderAudit() {
   const app = document.getElementById("app");
-  app.innerHTML = '<div class="card"><div class="row"><input id="aq" placeholder="过滤：op / entry / verdict…" style="flex:1" oninput="drawAudit()"></div><div id="audit-tbl"></div></div>';
+  app.innerHTML = '<div class="card"><div class="row"><input id="aq" placeholder="搜操作、条目或结果" style="flex:1" oninput="drawAudit()"></div><div id="audit-tbl"></div></div>';
   const r = await api("audit");
   S.events = parseAudit(r.events);
   drawAudit();
@@ -509,7 +526,7 @@ function drawAudit() {
   const q = (document.getElementById("aq")?.value ?? "").toLowerCase();
   const evs = S.events.filter((e) => !q || JSON.stringify(e).toLowerCase().includes(q)).slice(0, 300);
   const el = document.getElementById("audit-tbl");
-  if (!evs.length) { el.innerHTML = '<div class="empty">（暂无事件）</div>'; return; }
+  if (!evs.length) { el.innerHTML = '<div class="empty">还没有记录。用一次凭据，这里就会出现。</div>'; return; }
   el.innerHTML = "<table><tr><th>时间</th><th>操作</th><th>条目</th><th>字段</th><th>通道</th><th>原因</th><th>结果</th></tr>" +
     evs.map((e) => "<tr><td class='mono'>" + fmtTs(e.ts) + "</td><td>" + esc(e.op) + "</td><td>" + esc(e.entry) + "</td><td>" + esc(e.field) + "</td><td class='mono'>" + esc(e.channel) + "</td><td>" + esc(e.reason ?? "—") + "</td><td>" + verdictBadge(e.verdict) + "</td></tr>").join("") + "</table>";
 }
@@ -535,19 +552,19 @@ async function renderStats() {
   const p = await api("policy_get");
   app.innerHTML =
     '<div class="stats-grid">' +
-    '<div class="stat"><div class="num">' + evs.length + '</div><div class="lbl">总事件</div></div>' +
-    '<div class="stat"><div class="num" style="color:var(--green)">' + ok.length + '</div><div class="lbl">成功出水</div></div>' +
-    '<div class="stat"><div class="num">' + admin.length + '</div><div class="lbl">成功管理操作</div></div>' +
+    '<div class="stat"><div class="num">' + evs.length + '</div><div class="lbl">总记录</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--green)">' + ok.length + '</div><div class="lbl">成功取用</div></div>' +
+    '<div class="stat"><div class="num">' + admin.length + '</div><div class="lbl">管理操作</div></div>' +
     '<div class="stat"><div class="num" style="color:var(--red)">' + denied.length + '</div><div class="lbl">被拒绝</div></div>' +
-    '<div class="stat"><div class="num" style="color:var(--orange)">' + errors.length + '</div><div class="lbl">操作错误</div></div>' +
-    '<div class="stat"><div class="num" style="color:var(--violet)">' + expired.length + '</div><div class="lbl">已过期拒绝</div></div>' +
-    '<div class="stat"><div class="num">' + S.entries.length + '</div><div class="lbl">凭据条目</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--orange)">' + errors.length + '</div><div class="lbl">出错</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--violet)">' + expired.length + '</div><div class="lbl">已过期</div></div>' +
+    '<div class="stat"><div class="num">' + S.entries.length + '</div><div class="lbl">条目数</div></div>' +
     '</div>' +
-    '<div class="card"><h2>按条目成功出水频次</h2>' + top(byEntry).map(([k, v]) =>
+    '<div class="card"><h2>各条目被取用次数</h2>' + top(byEntry).map(([k, v]) =>
       '<div style="margin:6px 0"><div class="row" style="margin:0"><span class="mono" style="width:200px">' + esc(k) + '</span><span class="mono">' + v + '</span></div><div class="bar"><div style="width:' + (v / max * 100) + '%"></div></div></div>').join("") + '</div>' +
-    '<div class="card"><h2>按操作</h2><div class="kv">' + Object.entries(byOp).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
-    '<div class="card"><h2>按通道</h2><div class="kv">' + Object.entries(byChannel).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
-    '<div class="card"><h2>当前策略</h2><div class="kv"><b>resolve 白名单</b><span>' + (p.policy?.resolveReasons ?? []).map(esc).join(", ") + '</span><b>限速</b><span>' + esc(p.policy?.resolveRatePerMin ?? "-") + ' 次/分/字段</span></div></div>';
+    '<div class="card"><h2>各操作次数</h2><div class="kv">' + Object.entries(byOp).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
+    '<div class="card"><h2>各取用方式次数</h2><div class="kv">' + Object.entries(byChannel).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
+    '<div class="card"><h2>当前设置</h2><div class="kv"><b>允许的解析原因</b><span>' + (p.policy?.resolveReasons ?? []).map(esc).join(", ") + '</span><b>限速</b><span>' + esc(p.policy?.resolveRatePerMin ?? "-") + ' 次/分钟（每个字段）</span></div></div>';
 }
 
 // boot: token present -> try ping; else show login
