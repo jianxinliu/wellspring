@@ -1,4 +1,4 @@
-/// Wellspring CLI: put / delete / list / describe / view / resolve / policy / audit / exec / askpass
+/// Wellspring CLI: put / delete / list / describe / view / resolve / policy / audit / exec / derive / askpass
 /// exec = A1 (env) + A2 (fd) channels. Plaintext lives only in this process + child fds.
 import { connect } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -7,6 +7,9 @@ import { constants, tmpdir } from "node:os";
 import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync, statSync } from "node:fs";
 import type { Writable } from "node:stream";
 import { parseTemplate, renderTemplate, type TemplatePart } from "../core/template.ts";
+import { parseExecGuard, checkExecAllowed } from "../policy/exec.ts";
+import { sealMasterKey, unsealMasterKey } from "../core/store.ts";
+import { obtainPassphrase, readKeychainPassphrase, storeKeychainPassphrase, removeKeychainPassphrase } from "../core/custody.ts";
 
 const WS_HOME = process.env.WELLSPRING_HOME ?? join(process.env.HOME ?? "", ".wellspring");
 export const SOCK_PATH = process.env.WELLSPRING_SOCK ?? join(WS_HOME, "wellspringd.sock");
@@ -68,6 +71,16 @@ async function exec(rest: string[]): Promise<number> {
   if (dash < 0) throw new Error("usage: exec [--secret NAME=ref] [--secret-fd NAME=ref] [--secret-file NAME=ref] [--template-file NAME=path] [--git-cred ref] -- <cmd...>");
   const childArgs = rest.slice(dash + 1);
   if (!childArgs[0]) throw new Error("no command after --");
+  let policyReply;
+  try { policyReply = await rpc({ op: "policy_get" }); }
+  catch (error) {
+    // Older live daemons may not implement policy_get; all other failures refuse exec.
+    if (!(error instanceof Error) || error.message !== "unknown op: policy_get") throw new Error("unable to fetch exec policy");
+    policyReply = { policy: {} };
+  }
+  if (!policyReply?.policy || typeof policyReply.policy !== "object" || Array.isArray(policyReply.policy)) throw new Error("invalid exec policy response");
+  const decision = checkExecAllowed(parseExecGuard(policyReply.policy.exec), childArgs);
+  if (!decision.allowed) throw new Error(decision.reason);
 
   // Parse the entire plan before drawing secrets or creating files.
   const envRefs: Record<string, string> = Object.create(null);
@@ -202,6 +215,8 @@ async function exec(rest: string[]): Promise<number> {
     const inherited = { ...process.env };
     delete inherited.WELLSPRING_ADMIN_TOKEN;
     delete inherited.WELLSPRING_KEY;
+    delete inherited.WELLSPRING_PASSPHRASE;
+    delete inherited.WELLSPRING_PASSPHRASE_FILE;
     delete inherited.WELLSPRING_ONESHOT;
     const childEnv = { ...inherited, ...secretEnv, ...fileEnv, ...childEnvExtra };
     fdRefs.forEach(({ name }, i) => { childEnv[`WELLSPRING_FD_${name}`] = String(3 + i); });
@@ -244,6 +259,40 @@ async function main() {
     return i >= 0 ? rest[i + 1] : undefined;
   };
   switch (cmd) {
+    case "seal":
+      if (rest.length) throw new Error("usage: wellspring seal");
+      sealMasterKey();
+      console.log("Master key sealed (v2).");
+      break;
+    case "unseal":
+      if (rest.length) throw new Error("usage: wellspring unseal");
+      unsealMasterKey();
+      console.log("Master key unsealed (v1): the raw key is now readable by same-UID processes.");
+      break;
+    case "keychain": {
+      if (rest.length !== 1) throw new Error("usage: wellspring keychain store|remove|status");
+      switch (rest[0]) {
+        case "store":
+          storeKeychainPassphrase(obtainPassphrase(true));
+          console.log("Master passphrase stored in macOS keychain.");
+          break;
+        case "remove":
+          removeKeychainPassphrase();
+          console.log("Master passphrase removed from macOS keychain.");
+          break;
+        case "status": {
+          const { available, present } = readKeychainPassphrase();
+          console.log(!available ? "keychain unavailable (requires macOS security)" : present ? "keychain passphrase present and usable" : "keychain passphrase absent or not usable; unlock the login keychain or run wellspring keychain store");
+          break;
+        }
+        default: throw new Error("usage: wellspring keychain store|remove|status");
+      }
+      break;
+    }
+    case "--help":
+    case "help":
+      console.log("usage: wellspring <put|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ...\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
+      break;
     case "put": {
       const [id, field, value] = rest;
       if (!id || !field || value === undefined) throw new Error("usage: put <id> <field> <value> [--cls] [--mask] [--tag] [--ttl 30s|15m|12h|7d]");
@@ -305,6 +354,42 @@ async function main() {
       process.exitCode = process.exitCode || code;
       break;
     }
+    case "derive": {
+      // Human-facing counterpart of the MCP derive tool: the key stays in the daemon.
+      const [op, refOrId, field] = rest;
+      if (!op || !refOrId) throw new Error("usage: derive <totp|hmac|encrypt|decrypt> <ref|id> [field]");
+      if (!["totp", "hmac", "encrypt", "decrypt"].includes(op)) throw new Error(`unknown derive op: ${op}`);
+      // A bare id defaults to the "value" field, matching every other CLI subcommand.
+      const ref = refOrId.includes("/") ? refOrId : `${refOrId}/${field ?? "value"}`;
+      const msg: Record<string, unknown> = { op: `derive_${op}`, ref, token: adminToken() };
+      if (op === "hmac") {
+        msg.data = (await new Promise<string>((resolve, reject) => {
+          // HMAC needs the exact bytes to sign; a shell-mangled newline changes the MAC.
+          let text = "";
+          process.stdin.setEncoding("utf8");
+          process.stdin.on("data", (c) => { text += c; });
+          process.stdin.on("end", () => resolve(text.replace(/\r?\n$/, "")));
+          process.stdin.on("error", reject);
+        }));
+        msg.alg = flag("alg");
+      } else if (op === "encrypt" || op === "decrypt") {
+        const key = op === "encrypt" ? "plaintext" : "blob";
+        if (flag(key) !== undefined) {
+          msg[key] = flag(key);
+        } else {
+          msg[key] = (await new Promise<string>((resolve, reject) => {
+            let text = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (c) => { text += c; });
+            process.stdin.on("end", () => resolve(text.replace(/\r?\n$/, "")));
+            process.stdin.on("error", reject);
+          }));
+        }
+      }
+      const r = await rpc(msg);
+      console.log(op === "encrypt" || op === "decrypt" ? String(r.blob ?? r.plaintext) : JSON.stringify(r));
+      break;
+    }
     case "askpass": {
       // Called by git/ssh via GIT_ASKPASS/SSH_ASKPASS script. Env: WELLSPRING_REF, WELLSPRING_ONESHOT.
       const ref = process.env.WELLSPRING_REF;
@@ -316,7 +401,7 @@ async function main() {
       process.exit(0);
     }
     default:
-      console.error("usage: wellspring <put|delete|list|describe|view|resolve|policy|audit|exec|askpass> ...");
+      console.error("usage: wellspring <put|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ... (see --help)");
       process.exit(2);
   }
 }

@@ -1,5 +1,5 @@
 /// Wellspring MCP server (stdio). Agent-facing: descriptors only, never plaintext.
-/// Tools: wellspring_list, wellspring_describe, wellspring_exec.
+/// Tools: wellspring_list, wellspring_describe, wellspring_exec, wellspring_derive.
 /// Uses minimal MCP stdio JSON-RPC (initialize / tools/list / tools/call) — Phase 0
 /// avoids the SDK dependency to keep the compiled binary dependency-free.
 import { spawn } from "node:child_process";
@@ -10,6 +10,7 @@ import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from 'node:os';
 import type { Writable } from 'node:stream';
 import { parseTemplate, renderTemplate } from '../core/template.ts';
+import { parseExecGuard, checkExecAllowed } from '../policy/exec.ts';
 
 const WS_HOME = process.env.WELLSPRING_HOME ?? join(process.env.HOME ?? "", ".wellspring");
 const SOCK_PATH = process.env.WELLSPRING_SOCK ?? join(WS_HOME, "wellspringd.sock");
@@ -34,6 +35,7 @@ function rpc(msg: object): Promise<any> {
         let reply: any;
         try { reply = JSON.parse(buf.slice(0, i)); } catch (e) { return reject(e); }
         sock.end();
+        if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return reject(new Error('invalid daemon response'));
         reply.error ? reject(new Error(reply.error)) : resolve(reply);
       }
     });
@@ -74,6 +76,29 @@ const TOOLS = [
       required: ["command"],
     },
   },
+  {
+    name: "wellspring_derive",
+    description:
+      "Compute a TOTP code, HMAC signature, or AES-256-GCM encryption/decryption without exporting the key. Results enter agent context and may be sensitive; decrypt returns plaintext. Use only when disclosure of that result is authorized.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        op: {
+          type: "string",
+          enum: ["totp", "hmac", "encrypt", "decrypt"],
+          description: "totp = 2FA code; hmac = sign a string; encrypt/decrypt = AES-256-GCM ",
+        },
+        ref: { type: "string", description: "secret://id/field holding the key. totp wants a base32 seed; hmac wants the raw secret; aes wants a base64 32-byte key" },
+        data: { type: "string", description: "hmac only: the exact string to sign, at most 1 MiB" },
+        plaintext: { type: "string", description: "encrypt only: the text to encrypt, at most 1 MiB" },
+        blob: { type: "string", description: "decrypt only: base64 nonce|ciphertext|tag as produced by encrypt" },
+        alg: { type: "string", enum: ["sha256", "sha512"], description: "hmac only, default sha256" },
+        digits: { type: "integer", minimum: 6, maximum: 8, description: "totp only, default 6" },
+        period: { type: "integer", minimum: 1, maximum: 300, description: "totp only, default 30 seconds" },
+      },
+      required: ["op", "ref"],
+    },
+  },
 ];
 
 async function callTool(name: string, args: any): Promise<string> {
@@ -100,6 +125,16 @@ async function callTool(name: string, args: any): Promise<string> {
       if (!env || typeof env !== 'object' || Array.isArray(env) || Object.entries(env).some(([k,v]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || k.startsWith('WELLSPRING_') || typeof v !== 'string' || !v)) throw new Error('env must map variable names to secret refs; WELLSPRING_ names are reserved');
       if (!['none','redacted'].includes(output)) throw new Error('invalid output mode');
       if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 300000) throw new Error('timeoutMs must be 100..300000');
+      let policyReply;
+      try { policyReply = await rpc({ op: 'policy_get' }); }
+      catch (error) {
+        // Older live daemons may not implement policy_get; all other failures refuse exec.
+        if (!(error instanceof Error) || error.message !== 'unknown op: policy_get') throw new Error('unable to fetch exec policy');
+        policyReply = { policy: {} };
+      }
+      if (!policyReply?.policy || typeof policyReply.policy !== 'object' || Array.isArray(policyReply.policy)) throw new Error('invalid exec policy response');
+      const decision = checkExecAllowed(parseExecGuard(policyReply.policy.exec), command);
+      if (!decision.allowed) throw new Error(decision.reason);
       const templatePlans = Object.entries(templates).map(([name,text])=>({name,parts:parseTemplate(text as string)}));
       const tempDirs: string[] = [];
       try {
@@ -153,6 +188,26 @@ async function callTool(name: string, args: any): Promise<string> {
         return JSON.stringify({...result,timedOut,outputMode:output,stdout:streams[0],stderr:streams[1],truncated:captures.some(c=>c.truncated)});
       } finally { clearTimeout(timer); }
       } finally { for (const dir of tempDirs) rmSync(dir,{recursive:true,force:true}); }
+    }
+    case "wellspring_derive": {
+      const { op, ref, data, plaintext, blob, alg, digits, period } = args;
+      if (!["totp","hmac","encrypt","decrypt"].includes(op)) throw new Error("invalid derive op");
+      if (typeof ref !== "string" || !ref) throw new Error("ref must be a secret://id/field reference");
+      if (op === "totp") {
+        if (digits !== undefined && (!Number.isInteger(digits) || digits < 6 || digits > 8)) throw new Error("digits must be 6..8");
+        if (period !== undefined && (!Number.isInteger(period) || period < 1 || period > 300)) throw new Error("period must be 1..300 seconds");
+      }
+      if (op === "hmac") {
+        if (typeof data !== "string") throw new Error("hmac requires a data string");
+        if (alg !== undefined && !["sha256","sha512"].includes(alg)) throw new Error("alg must be sha256 or sha512");
+      }
+      if (op === "encrypt" && typeof plaintext !== "string") throw new Error("encrypt requires a plaintext string");
+      if (op === "decrypt" && typeof blob !== "string") throw new Error("decrypt requires a base64 blob string");
+      // The daemon decides: it holds the key, so the key never crosses the socket.
+      const r = await rpc({ op: `derive_${op}`, ref, data, plaintext, blob, alg, digits, period, token: adminToken() });
+      // A derived artefact is safe to return by design, but the key is not.
+      const text = JSON.stringify(r);
+      return text;
     }
     default:
       throw new Error(`unknown tool: ${name}`);

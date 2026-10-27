@@ -11,23 +11,61 @@ const ADMIN_TOKEN = "test-admin-token-xyz";
 process.env.WELLSPRING_ADMIN_TOKEN = ADMIN_TOKEN;
 
 let daemon: ChildProcess;
+// The suite daemon also serves the Web UI on an announced ephemeral port.
+// Reuse it to reduce process churn and keep HTTP and socket checks on one instance.
+let httpPort = 0;
+// The daemon's pipes must be drained: a full stderr pipe blocks the writer, and a
+// blocked daemon looks exactly like a dead one. Cap it so a log storm cannot eat RAM.
+let daemonLog = "";
+let daemonExited: string | undefined;
 
 beforeAll(async () => {
   daemon = spawn("bun", ["run", join(import.meta.dir, "../src/daemon/main.ts")], {
-    env: { ...process.env },
+    env: { ...process.env, WELLSPRING_HTTP_PORT: "0" },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const collect = (kind: string) => (c: Buffer) => {
+    daemonLog += `[${kind}] ${c.toString()}`;
+    if (daemonLog.length > 65536) daemonLog = daemonLog.slice(-16384);
+  };
+  daemon.stdout!.on("data", collect("out"));
+  daemon.stderr!.on("data", collect("err"));
+  daemon.once("exit", (code, signal) => { daemonExited = `exit code=${code} signal=${signal}`; });
   // Wait for the socket to actually answer. A fixed sleep races a loaded machine:
   // when it loses, every later test fails with ENOENT instead of a real signal.
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + 20000;
+  let socketReady = false;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
-    try { if ((await rpc({ op: "ping" })).pong) return; } catch { /* not up yet */ }
+    if (daemonExited) throw new Error(`daemon died during startup (${daemonExited}); log: ${daemonLog}`);
+    try {
+      if ((await rpc({ op: "ping" })).pong) { socketReady = true; break; }
+    } catch { /* not up yet */ }
+    if (httpPort === 0) {
+      const m = /wellspring web UI: http:\/\/127\.0\.0\.1:(\d+)/.exec(daemonLog);
+      if (m) httpPort = Number(m[1]);
+    }
   }
-  throw new Error("daemon failed to start within 30s");
+  if (!socketReady) throw new Error(`daemon socket did not become ready; log: ${daemonLog}`);
+  // The UI binds after the socket; wait for its line rather than assuming.
+  const uiDeadline = Date.now() + 10000;
+  while (httpPort === 0 && Date.now() < uiDeadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    const m = /wellspring web UI: http:\/\/127\.0\.0\.1:(\d+)/.exec(daemonLog);
+    if (m) httpPort = Number(m[1]);
+  }
+  if (!httpPort) throw new Error(`suite daemon never announced a web port; log: ${daemonLog}`);
+  try {
+    const res = await fetch(`http://127.0.0.1:${httpPort}/api/ping`, { method: "POST", body: "{}" });
+    if (!(await res.json()).pong) throw new Error("web ui answered but not with pong");
+  } catch (e) {
+    throw new Error(`web ui on ${httpPort} not reachable: ${String(e?.message ?? e)}`);
+  }
 });
 
 afterAll(() => {
+  // Report a mid-suite death instead of letting 40 ENOENT failures hide the cause.
+  if (daemonExited) console.error(`\nwellspringd exited during the suite (${daemonExited}); tail of its log:\n${daemonLog.slice(-4000)}\n`);
   daemon?.kill();
   rmSync(DIR, { recursive: true, force: true });
 });
@@ -305,20 +343,8 @@ test("Web UI falls back to an ephemeral port when 7777 is busy", async () => {
 });
 
 test("Web UI HTTP API: auth, vault ops, audit", async () => {
-  const port = 7801;
-  const { spawn: sp } = await import("node:child_process");
-  // NOTE: isolated HOME/SOCK so this second daemon cannot clobber the suite daemon's socket file
-  const webDir = mkdtempSync(join(tmpdir(), "wellspring-web-"));
-  const d = sp("bun", ["run", join(import.meta.dir, "../src/daemon/main.ts")], {
-    env: {
-      ...process.env,
-      WELLSPRING_HOME: join(webDir, "home"),
-      WELLSPRING_SOCK: join(webDir, "wellspringd.sock"),
-      WELLSPRING_HTTP_PORT: String(port),
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  await new Promise((r) => setTimeout(r, 800));
+  // Exercise HTTP against the same isolated daemon used by the socket tests.
+  const port = httpPort;
   const post = async (op: string, body: object, tok?: string) => {
     const res = await fetch(`http://127.0.0.1:${port}/api/${op}`, {
       method: "POST",
@@ -359,8 +385,6 @@ test("Web UI HTTP API: auth, vault ops, audit", async () => {
   expect(evs.some((e: any) => e.op === "draw_env" && e.verdict === "ok")).toBe(true);
   // HTTP not reachable from non-loopback? (bind check)
   expect(evs.length).toBeGreaterThan(0);
-  d.kill();
-  rmSync(webDir, { recursive: true, force: true });
 });
 
 test("vault management validates writes, rotates and deletes with audit", async () => {
@@ -556,4 +580,261 @@ test("CLI: --ttl accepts durations and enforces expiry", async () => {
   expect(expired.stderr.toString()).toContain("expired");
   expect(expired.stdout.toString() + expired.stderr.toString()).not.toContain("cli-plaintext-HHH");
   expect(cli(["put", "cred:cli_bad", "value", "x", "--ttl", "soon"]).exitCode).not.toBe(0);
+});
+
+// ---- Master key custody: separate homes never disturb the shared daemon. ----
+const custodyStore = join(import.meta.dir, "../src/core/store.ts");
+const custodyCli = join(import.meta.dir, "../src/cli/main.ts");
+function custodyEnv(home: string, extra: Record<string, string | undefined> = {}) {
+  return { ...process.env, WELLSPRING_HOME: home, WELLSPRING_KEY: undefined,
+    WELLSPRING_PASSPHRASE: undefined, WELLSPRING_PASSPHRASE_FILE: undefined, ...extra };
+}
+function custodyScript(home: string, script: string, extra: Record<string, string | undefined> = {}) {
+  return Bun.spawnSync({ cmd: [process.execPath, "-e", `import * as store from ${JSON.stringify(custodyStore)}; ${script}`],
+    env: custodyEnv(home, extra), stdin: "ignore", timeout: 15000 });
+}
+function custodyCommand(home: string, args: string[], extra: Record<string, string | undefined> = {}) {
+  return Bun.spawnSync({ cmd: [process.execPath, custodyCli, ...args], env: custodyEnv(home, extra), stdin: "ignore", timeout: 15000 });
+}
+
+test("custody: seal, rewrap and unseal preserve stored secret and master key", async () => {
+  const { readFileSync, statSync } = await import("node:fs");
+  const home = join(DIR, "custody-roundtrip");
+  const password = "synthetic-custody-test-password";
+  const env = { WELLSPRING_PASSPHRASE: password };
+  expect(custodyScript(home, 'store.putSecret("cred:custody", "value", "custody-test-secret");').exitCode).toBe(0);
+  const path = join(home, "master.key");
+  const original = readFileSync(path);
+  expect(original.length).toBe(32);
+  expect(custodyCommand(home, ["seal"], env).exitCode).toBe(0);
+  const sealed = readFileSync(path);
+  expect(sealed.length).toBe(77);
+  expect(sealed[0]).toBe(2);
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+  const read = custodyScript(home, 'console.log(store.getSecret("cred:custody", "value") === "custody-test-secret");', env);
+  expect(read.exitCode).toBe(0);
+  expect(read.stdout.toString().trim()).toBe("true");
+  expect(custodyCommand(home, ["seal"], env).exitCode).toBe(0);
+  expect(readFileSync(path).equals(sealed)).toBe(false);
+  const unseal = custodyCommand(home, ["unseal"], env);
+  expect(unseal.exitCode).toBe(0);
+  expect(unseal.stdout.toString()).toContain("same-UID");
+  expect(readFileSync(path).equals(original)).toBe(true);
+}, 60000);
+
+test("custody: wrong or unavailable passphrase fails without returning a secret", () => {
+  const home = join(DIR, "custody-wrong");
+  expect(custodyScript(home, 'store.putSecret("cred:custody", "value", "never-return-this-secret");').exitCode).toBe(0);
+  expect(custodyCommand(home, ["seal"], { WELLSPRING_PASSPHRASE: "correct-test-password" }).exitCode).toBe(0);
+  for (const extra of [{ WELLSPRING_PASSPHRASE: "wrong-test-password" }, { PATH: "/no-such-wellspring-path" }]) {
+    const read = custodyScript(home, 'console.log(store.getSecret("cred:custody", "value"));', extra);
+    expect(read.exitCode).not.toBe(0);
+    expect(read.stdout.toString()).toBe("");
+    expect(read.stderr.toString()).toContain("WELLSPRING_PASSPHRASE");
+    expect(read.stderr.toString()).toContain("keychain");
+    expect(read.stderr.toString()).not.toContain("never-return-this-secret");
+  }
+}, 60000);
+
+test("custody: v1 key remains untouched and passphrase file follows environment", async () => {
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const home = join(DIR, "custody-v1");
+  expect(custodyScript(home, 'store.putSecret("cred:custody", "value", "v1-secret");').exitCode).toBe(0);
+  const path = join(home, "master.key");
+  const original = readFileSync(path);
+  expect(custodyScript(home, 'console.log(store.getSecret("cred:custody", "value") === "v1-secret");', { PATH: "/no-such-wellspring-path" }).stdout.toString().trim()).toBe("true");
+  expect(readFileSync(path).equals(original)).toBe(true);
+  const passfile = join(home, "passphrase");
+  writeFileSync(passfile, "file-test-password\n", { mode: 0o600 });
+  const env = { WELLSPRING_PASSPHRASE_FILE: passfile };
+  expect(custodyCommand(home, ["seal"], env).exitCode).toBe(0);
+  expect(custodyScript(home, 'console.log(store.getSecret("cred:custody", "value") === "v1-secret");', env).stdout.toString().trim()).toBe("true");
+  expect(custodyScript(home, 'store.getMasterKey();', { ...env, WELLSPRING_PASSPHRASE: "wrong-override" }).exitCode).not.toBe(0);
+  expect(custodyCommand(home, ["seal"], { WELLSPRING_KEY: Buffer.alloc(32).toString("base64") }).stderr.toString()).toContain("refuses WELLSPRING_KEY");
+}, 60000);
+
+test("custody: keychain status gracefully handles missing security binary", () => {
+  const result = custodyCommand(join(DIR, "custody-no-keychain"), ["keychain", "status"], { PATH: "/no-such-wellspring-path" });
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout.toString()).toContain("keychain unavailable");
+  expect(result.stderr.toString()).toBe("");
+}, 60000);
+
+test("custody: wrapping helpers support a fast explicit test scrypt profile", async () => {
+  const { wrapMasterKey, unwrapMasterKey, SCRYPT_PARAMS } = await import("../src/core/store.ts");
+  const params = { ...SCRYPT_PARAMS, N: 16 };
+  const key = new Uint8Array(32).fill(7);
+  const wrapped = wrapMasterKey(key, "synthetic-fast-password", params);
+  expect(unwrapMasterKey(wrapped, "synthetic-fast-password", params)).toEqual(key);
+  expect(() => unwrapMasterKey(wrapped, "incorrect", params)).toThrow("passphrase is incorrect or unavailable");
+});
+
+// ---- Target-command allowlist: all policy changes are scoped and restored. ----
+test('exec guard matches exact argv, single/rest wildcards and deny precedence', async () => {
+  const { parseExecGuard, matchExecRule, checkExecAllowed } = await import('../src/policy/exec.ts');
+  const guard = parseExecGuard({ allow: ['node *', 'psql **', '"/usr/bin/node app.js" "quoted arg"'], deny: ['node blocked.js'] });
+  expect(guard.enabled).toBe(true);
+  expect(matchExecRule(guard.allow[0], ['node', 'a.js'])).toBe(true);
+  expect(matchExecRule(guard.allow[0], ['node'])).toBe(false);
+  expect(matchExecRule(guard.allow[0], ['node', 'a.js', 'extra'])).toBe(false);
+  expect(matchExecRule(guard.allow[1], ['psql'])).toBe(true);
+  expect(matchExecRule(guard.allow[1], ['psql', '-c', 'select 1'])).toBe(true);
+  expect(matchExecRule(guard.allow[2], ['/usr/bin/node app.js', 'quoted arg'])).toBe(true);
+  expect(checkExecAllowed(guard, ['node', 'blocked.js', 'private-arg']).allowed).toBe(false);
+  expect(checkExecAllowed(guard, ['node', 'blocked.js'])).toEqual({ allowed: false, reason: 'command denied by policy: node' });
+  expect(checkExecAllowed(guard, ['sh', 'private-arg'])).toEqual({ allowed: false, reason: 'command not in exec allowlist: sh' });
+  expect(checkExecAllowed(guard, [])).toEqual({ allowed: false, reason: 'empty command' });
+  expect(checkExecAllowed(parseExecGuard({}), ['node'])).toEqual({ allowed: false, reason: 'no exec rule allows this command' });
+  expect(checkExecAllowed(parseExecGuard(undefined), [])).toEqual({ allowed: true });
+});
+
+test('exec guard rejects malformed policy without mutating input', async () => {
+  const { parseExecGuard } = await import('../src/policy/exec.ts');
+  expect(parseExecGuard(undefined)).toEqual({ enabled: false, allow: [], deny: [] });
+  for (const input of [null, [], true, { enabled: 'yes' }, { allow: 'node' }, { deny: [1] },
+    { allow: ['node "unfinished'] }, { allow: ['node ** middle'] }, { deny: ['node ** *'] },
+    { allow: ['node ** **'] }, { allow: [''] }, { allow: ['   '] }, { allow: ['"" arg'] },
+    { allow: ['* arg'] }, { allow: ['**'] }, { allow: ['node\0arg'] }, { allow: ['node\narg'] },
+    { allow: Array(101).fill('node'), deny: Array(100).fill('psql') }]) {
+    expect(() => parseExecGuard(input)).toThrow();
+  }
+  expect(() => parseExecGuard({ allow: ['node "unfinished'] })).toThrow('unbalanced quotes');
+  expect(() => parseExecGuard({ allow: ['node ** middle'] })).toThrow('final position');
+  const input = Object.freeze({ allow: Object.freeze(['node *']), deny: Object.freeze([]) });
+  expect(parseExecGuard(input).allow).toEqual([{ argv0: 'node', args: ['*'] }]);
+  expect(input.allow).toEqual(['node *']);
+  expect(parseExecGuard({ allow: Array(200).fill('node') }).allow.length).toBe(200);
+});
+
+async function withExecPolicy(exec: object, run: () => Promise<void>) {
+  const original = (await rpc({ op: 'policy_get' })).policy;
+  try {
+    expect((await rpc({ op: 'policy_put', policy: { ...original, exec }, ...AUTH })).ok).toBe(true);
+    expect((await rpc({ op: 'policy_get' })).policy.exec).toEqual(exec);
+    await run();
+  } finally {
+    expect((await rpc({ op: 'policy_put', policy: original, ...AUTH })).ok).toBe(true);
+  }
+}
+
+function execPolicyCli(args: string[]) {
+  return Bun.spawnSync({ cmd: ['bun', join(import.meta.dir, '../src/cli/main.ts'), 'exec', ...args], env: { ...process.env } });
+}
+
+test('CLI exec allowlist refuses before any draw or temporary secret directory', async () => {
+  const { readFileSync, readdirSync, existsSync } = await import('node:fs');
+  await withExecPolicy({ enabled: true, allow: ['psql **'], deny: [] }, async () => {
+    const auditPath = join(process.env.WELLSPRING_HOME!, 'draw-events.jsonl');
+    const audit = () => existsSync(auditPath) ? readFileSync(auditPath, 'utf8') : '';
+    const beforeAudit = audit();
+    const dirs = () => readdirSync(tmpdir()).filter(n => n.startsWith('ws-file-') || n.startsWith('ws-mcp-file-'));
+    const beforeDirs = new Set(dirs());
+    const result = execPolicyCli(['--secret', 'PASSWORD=cred:db_prod/password', '--secret-file', 'PASSFILE=cred:db_prod/password', '--', 'node', '-e', 'throw Error("must not run")']);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).toContain('command not in exec allowlist: node');
+    expect(audit()).toBe(beforeAudit);
+    expect(dirs().filter(n => !beforeDirs.has(n))).toEqual([]);
+  });
+});
+
+test('CLI exec matching fixed arguments delivers secrets end to end', async () => {
+  const script = 'console.log(process.env.PASSWORD === "hunter2-super-secret")';
+  await withExecPolicy({ enabled: true, allow: [`node -e '${script}'`], deny: [] }, async () => {
+    const result = execPolicyCli(['--secret', 'PASSWORD=cred:db_prod/password', '--', 'node', '-e', script]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr.toString()).toBe('');
+    expect(result.stdout.toString().trim()).toBe('true');
+  });
+});
+
+test('MCP exec uses deny-first allowlist before templates or draws', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  await withExecPolicy({ enabled: true, allow: ['node **'], deny: ['node **'] }, async () => {
+    const auditPath = join(process.env.WELLSPRING_HOME!, 'draw-events.jsonl');
+    const beforeAudit = readFileSync(auditPath, 'utf8');
+    const beforeDirs = new Set(readdirSync(tmpdir()));
+    const p = spawn('bun', [join(import.meta.dir, '../src/mcp/server.ts')], { env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let text = '';
+    p.stdout!.on('data', c => text += c);
+    const done = new Promise<void>((resolve, reject) => { p.once('close', () => resolve()); p.once('error', reject); });
+    p.stdin!.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'wellspring_exec', arguments: {
+      env: { PASSWORD: 'cred:db_prod/password' }, files: { PASSFILE: 'cred:db_prod/password' },
+      templates: { CONFIG: '{{bad}}' }, command: ['node', '-e', 'private-command-arg'],
+    } } }) + '\n');
+    await done;
+    const result = JSON.parse(text).result;
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe('error: command denied by policy: node');
+    expect(readFileSync(auditPath, 'utf8')).toBe(beforeAudit);
+    expect(readdirSync(tmpdir()).filter(n => (n.startsWith('ws-file-') || n.startsWith('ws-mcp-file-')) && !beforeDirs.has(n))).toEqual([]);
+  });
+});
+
+test('CLI and MCP exec fail closed on policy errors and support legacy policy_get', async () => {
+  const { createServer } = await import('node:net');
+  const socket = join(DIR, 'exec-policy-probe.sock');
+  let reply: unknown;
+  const ops: string[] = [];
+  const server = createServer(sock => {
+    let buf = '';
+    sock.on('data', chunk => {
+      buf += chunk.toString();
+      if (!buf.includes('\n')) return;
+      const request = JSON.parse(buf.slice(0, buf.indexOf('\n')));
+      ops.push(request.op);
+      sock.end(JSON.stringify(request.op === 'policy_get' ? reply : { env: {} }) + '\n');
+    });
+  });
+  await new Promise<void>(resolve => server.listen(socket, resolve));
+  try {
+    for (const mcp of [false, true]) {
+      for (const response of [{ error: 'policy backend unavailable' }, null, {}, { policy: { exec: { allow: ['node ** middle'] } } }, { error: 'unknown op: policy_get' }]) {
+        reply = response;
+        ops.length = 0;
+        const legacy = (response as any)?.error === 'unknown op: policy_get';
+        const argv = mcp ? [join(import.meta.dir, '../src/mcp/server.ts')] : [join(import.meta.dir, '../src/cli/main.ts'), 'exec', '--', 'node', '-e', ''];
+        const p = spawn('bun', argv, { env: { ...process.env, WELLSPRING_SOCK: socket }, stdio: ['pipe', 'pipe', 'pipe'] });
+        let text = '';
+        p.stdout!.on('data', c => text += c);
+        const done = new Promise<number | null>((resolve, reject) => { p.once('close', resolve); p.once('error', reject); });
+        p.stdin!.end(mcp ? JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'wellspring_exec', arguments: { command: ['node', '-e', ''] } } }) + '\n' : '');
+        const code = await done;
+        if (mcp) expect(JSON.parse(text).result.isError === true).toBe(!legacy);
+        else expect(code === 0).toBe(legacy);
+        expect(ops).toEqual(legacy && mcp ? ['policy_get', 'draw_env'] : ['policy_get']);
+      }
+    }
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+// ---- derived artefacts: the key stays in the daemon, only the result crosses ----
+test("derive returns artefacts over the socket and never the key material", async () => {
+  await rpc({ op: "put", id: "cred:mfa", field: "value", value: "JBSWY3DPEHPK3PXP", token: ADMIN_TOKEN });
+  await rpc({ op: "put", id: "cred:sig", field: "key", value: "wellspring-hmac-key", token: ADMIN_TOKEN });
+  const totp = await rpc({ op: "derive_totp", ref: "cred:mfa/value", token: ADMIN_TOKEN });
+  expect(totp.code).toMatch(/^\d{6}$/);
+  expect(typeof totp.remaining).toBe("number");
+  const mac = await rpc({ op: "derive_hmac", ref: "cred:sig/key", data: "GET /v1/orders", alg: "sha256", token: ADMIN_TOKEN });
+  expect(mac.mac).toMatch(/^[0-9a-f]{64}$/);
+  // The whole point: the key itself must not be echoed back in any field.
+  const blob = JSON.stringify(totp) + JSON.stringify(mac);
+  expect(blob).not.toContain("JBSWY3DPEHPK3PXP");
+  expect(blob).not.toContain("wellspring-hmac-key");
+  // And an expired credential must not be used as signing material either.
+  await rpc({ op: "put", id: "cred:short", field: "key", value: "k", ttlMs: 1000, token: ADMIN_TOKEN });
+  await new Promise((r) => setTimeout(r, 1200));
+  const expired = await rpc({ op: "derive_hmac", ref: "cred:short/key", data: "x", token: ADMIN_TOKEN });
+  expect(expired.error).toContain("expired");
+  const events = (await rpc({ op: "audit" })).events.map((l: string) => JSON.parse(l));
+  expect(events.some((e: any) => e.op === "derive_hmac" && e.verdict === "expired")).toBe(true);
+});
+
+test("derive refuses callers without the admin token, even for a reveal-only op", async () => {
+  await rpc({ op: "put", id: "cred:mfa2", field: "value", value: "JBSWY3DPEHPK3PXP", token: ADMIN_TOKEN });
+  const denied = await rpc({ op: "derive_totp", ref: "cred:mfa2/value" });
+  expect(denied.error).toBe("unauthorized");
+  // An unauthenticated caller must learn nothing: not the code, not even whether it is expired.
+  expect(JSON.stringify(denied)).not.toContain("expired");
 });

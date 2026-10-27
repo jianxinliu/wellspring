@@ -4,7 +4,8 @@
  * Master key: from env WELLSPRING_KEY (base64) or keyfile ~/.wellspring/master.key
  */
 import { gcm } from "@noble/ciphers/aes";
-import { randomBytes } from "node:crypto";
+import { randomBytes, scryptSync } from "node:crypto";
+import { obtainPassphrase, SEALED_KEY_ERROR } from "./custody.ts";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, chmodSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -14,16 +15,64 @@ export const STORE_PATH = join(WS_HOME, "store.json");
 const MASTER_KEY_PATH = join(WS_HOME, "master.key");
 
 // ---------- master key ----------
+export const SCRYPT_PARAMS = Object.freeze({ N: 2 ** 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+export type ScryptParams = typeof SCRYPT_PARAMS;
+const KEYFILE_V2_LENGTH = 1 + 16 + 12 + 32 + 16;
+
+/** Parameters can be supplied by isolated tests; files do not encode a KDF profile. */
+export function unwrapMasterKey(blob: Uint8Array, passphrase: string, params: ScryptParams = SCRYPT_PARAMS): Uint8Array {
+  if (blob.length !== KEYFILE_V2_LENGTH || blob[0] !== 2) throw new Error("corrupt master key (expected raw v1 or sealed v2 keyfile)");
+  try {
+    const wrappingKey = scryptSync(passphrase, blob.subarray(1, 17), 32, params);
+    try { return gcm(wrappingKey, blob.subarray(17, 29)).decrypt(blob.subarray(29)); }
+    finally { wrappingKey.fill(0); }
+  } catch { throw new Error(SEALED_KEY_ERROR); }
+}
+
+export function wrapMasterKey(key: Uint8Array, passphrase: string, params: ScryptParams = SCRYPT_PARAMS): Uint8Array {
+  if (key.length !== 32 || !passphrase) throw new Error("a 32-byte master key and nonempty passphrase are required");
+  const salt = randomBytes(16);
+  const nonce = randomBytes(12);
+  const wrappingKey = scryptSync(passphrase, salt, 32, params);
+  try { return Buffer.concat([Buffer.from([2]), salt, nonce, gcm(wrappingKey, nonce).encrypt(key)]); }
+  finally { wrappingKey.fill(0); }
+}
+
 export function getMasterKey(): Uint8Array {
   if (process.env.WELLSPRING_KEY) {
     return Buffer.from(process.env.WELLSPRING_KEY, "base64");
   }
   if (existsSync(MASTER_KEY_PATH)) {
     const k = readFileSync(MASTER_KEY_PATH);
-    if (k.length !== 32) throw new Error("corrupt master key (expected 32 bytes)");
-    return new Uint8Array(k);
+    if (k.length === 32) return new Uint8Array(k); // v1 is always exactly 32 raw bytes.
+    if (k.length !== KEYFILE_V2_LENGTH || k[0] !== 2) throw new Error("corrupt master key (expected raw v1 or sealed v2 keyfile)");
+    return unwrapMasterKey(k, obtainPassphrase());
   }
   return initMasterKey();
+}
+
+function replaceMasterKey(blob: Uint8Array): void {
+  const tmp = MASTER_KEY_PATH + ".tmp";
+  writeFileSync(tmp, blob, { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, MASTER_KEY_PATH);
+  chmodSync(MASTER_KEY_PATH, 0o600);
+}
+
+export function sealMasterKey(): void {
+  if (process.env.WELLSPRING_KEY !== undefined) throw new Error("seal refuses WELLSPRING_KEY: unset it to use file custody");
+  if (!existsSync(MASTER_KEY_PATH)) throw new Error("no master keyfile to seal; initialize the store first");
+  const key = getMasterKey(); // A sealed key must be unlocked before re-wrapping.
+  try { replaceMasterKey(wrapMasterKey(key, obtainPassphrase(true))); }
+  finally { key.fill(0); }
+}
+
+export function unsealMasterKey(): void {
+  if (process.env.WELLSPRING_KEY !== undefined) throw new Error("unseal refuses WELLSPRING_KEY: unset it to use file custody");
+  if (!existsSync(MASTER_KEY_PATH)) throw new Error("no master keyfile to unseal");
+  const key = getMasterKey();
+  try { replaceMasterKey(key); }
+  finally { key.fill(0); }
 }
 
 function initMasterKey(): Uint8Array {

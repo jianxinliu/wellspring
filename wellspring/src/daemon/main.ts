@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { listDescriptors, describe, getSecret, getSecretFresh, putSecret, deleteSecret, mask, fingerprint, isExpiryError } from "../core/store.ts";
+import { listDescriptors, describe, getSecret, getSecretFresh, putSecret, deleteSecret, mask, fingerprint, isExpiryError, getMasterKey } from "../core/store.ts";
+import { totp, hmac, encryptAesGcm, decryptAesGcm } from "../core/derive.ts";
 
 export const WS_HOME = process.env.WELLSPRING_HOME ?? join(homedir(), ".wellspring");
 export const SOCK_PATH = process.env.WELLSPRING_SOCK ?? join(WS_HOME, "wellspringd.sock");
@@ -17,10 +18,31 @@ export const POLICY_PATH = join(WS_HOME, "policy.json");
 const AUDIT_PATH = join(WS_HOME, "draw-events.jsonl");
 
 // ---------- policy (configurable reason allowlist) ----------
-type Policy = { resolveReasons: string[]; resolveRatePerMin: number };
+// The exec guard is stored in its raw string form so the Web UI can render the
+// rules the operator typed; it is parsed on demand by the exec paths.
+type Policy = { resolveReasons: string[]; resolveRatePerMin: number; exec?: ExecGuardRaw };
+type ExecGuardRaw = { enabled: boolean; allow: string[]; deny: string[] };
+
+function validateExecGuard(input: unknown): ExecGuardRaw {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid exec policy");
+  const { enabled, allow, deny } = input as ExecGuardRaw;
+  if (enabled !== undefined && typeof enabled !== "boolean") throw new Error("invalid exec.enabled: expected a boolean");
+  const rules = (v: unknown, name: string): string[] => {
+    if (v === undefined) return [];
+    if (!Array.isArray(v)) throw new Error(`invalid exec.${name}: expected an array of command strings`);
+    for (const rule of v) {
+      if (typeof rule !== "string" || !rule.trim()) throw new Error(`invalid exec.${name}: expected nonempty command strings`);
+      if (rule.length > 512 || /[\u0000-\u001f\u007f]/u.test(rule)) throw new Error(`invalid exec.${name}: rule too long or contains control characters`);
+    }
+    if (v.length > 200) throw new Error(`invalid exec.${name}: at most 200 rules`);
+    return [...v];
+  };
+  return { enabled: enabled ?? true, allow: rules(allow, "allow"), deny: rules(deny, "deny") };
+}
+
 function validatePolicy(input: unknown): Policy {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid policy");
-  const { resolveReasons, resolveRatePerMin } = input as Policy;
+  const { resolveReasons, resolveRatePerMin, exec } = input as Policy;
   if (!Array.isArray(resolveReasons) || resolveReasons.length === 0 || resolveReasons.length > 100 ||
     Array.from(resolveReasons).some((reason) => typeof reason !== "string" || !reason.trim() || reason.length > 256 || /[\u0000-\u001f\u007f]/u.test(reason))) {
     throw new Error("invalid resolveReasons: expected 1..100 nonempty strings of at most 256 characters");
@@ -28,7 +50,11 @@ function validatePolicy(input: unknown): Policy {
   if (!Number.isInteger(resolveRatePerMin) || resolveRatePerMin < 1 || resolveRatePerMin > 10000) {
     throw new Error("invalid resolveRatePerMin: expected an integer from 1 to 10000");
   }
-  return { resolveReasons: [...resolveReasons], resolveRatePerMin };
+  const base: Policy = { resolveReasons: [...resolveReasons], resolveRatePerMin };
+  // Reject a malformed rule list at save time, so a typo cannot silently
+  // disable the guard later when the exec path parses it.
+  if (exec !== undefined) base.exec = validateExecGuard(exec);
+  return base;
 }
 function loadPolicy(): Policy {
   if (existsSync(POLICY_PATH)) {
@@ -122,6 +148,58 @@ function drawFresh(base: Omit<DrawEvent, "verdict" | "ts">): { value: string } |
 function parseRef(ref: string): [string, string] {
   const [id, field = "value"] = String(ref).replace(/^secret:\/\//, "").split("/");
   return [id, field];
+}
+
+/**
+ * Derived operations: the caller states WHICH key and WHAT to compute, and gets
+ * only the artefact back. This is the one place where a value crosses the socket
+ * by design — a TOTP code or a signature is not the key that produced it.
+ *
+ * Order matters: authenticate first, then rate limit, then expiry, then compute.
+ * Otherwise an unauthenticated caller could use the error text as an oracle for
+ * which keys exist or which ones are expired.
+ */
+function deriveOp(msg: any): any {
+  const base = { ts: Date.now(), op: String(msg.op), entry: String(msg.ref ?? ""), field: "*", channel: String(msg.op) };
+  if (burnToken(msg) !== "admin") {
+    logDraw({ ...base, verdict: "denied_auth" });
+    return { error: "unauthorized" };
+  }
+  const [id, field] = parseRef(msg.ref);
+  const event = { ...base, entry: `${id}/${field}` };
+  // A derived artefact is cheaper to abuse than a plaintext draw, but minting
+  // signatures in a loop is still a signing oracle: cap it like anything else.
+  if (rateLimited(`derive:${id}/${field}`)) {
+    logDraw({ ...event, verdict: "denied_rate" });
+    return { error: "rate limited" };
+  }
+  try {
+    const material = getSecretFresh(id, field);
+    let result: any;
+    if (msg.op === "derive_totp") {
+      const r = totp(material, { digits: Number(msg.digits ?? 6), period: Number(msg.period ?? 30) });
+      result = { code: r.code, period: r.period, remaining: r.remaining, expiresAt: r.expiresAt };
+    } else if (msg.op === "derive_hmac") {
+      const alg = msg.alg === "sha512" ? "sha512" : "sha256";
+      if (typeof msg.data !== "string") throw new Error("data must be a string");
+      result = { alg, mac: hmac(material, msg.data, alg) };
+    } else if (msg.op === "derive_encrypt") {
+      if (typeof msg.plaintext !== "string") throw new Error("plaintext must be a string");
+      result = { blob: encryptAesGcm(material, msg.plaintext) };
+    } else {
+      if (typeof msg.blob !== "string") throw new Error("blob must be a string");
+      result = { plaintext: decryptAesGcm(material, msg.blob) };
+    }
+    logDraw({ ...event, verdict: "ok" });
+    return result;
+  } catch (error) {
+    if (isExpiryError(error)) {
+      logDraw({ ...event, verdict: "expired" });
+      return { error: `secret expired: ${id}/${field}` };
+    }
+    logDraw({ ...event, verdict: "error" });
+    return { error: String(error?.message ?? error) };
+  }
 }
 
 export function handle(msg: any): any {
@@ -231,6 +309,11 @@ export function handle(msg: any): any {
     }
     case "audit":
       return { events: existsSync(AUDIT_PATH) ? readFileSync(AUDIT_PATH, "utf8").trim().split("\n") : [] };
+    case "derive_totp":
+    case "derive_hmac":
+    case "derive_encrypt":
+    case "derive_decrypt":
+      return deriveOp(msg);
     default:
       return { error: `unknown op: ${msg.op}` };
   }
@@ -280,6 +363,15 @@ if (import.meta.main) {
     if (error.code === "EADDRINUSE") return;
     console.error(`wellspringd failed to listen on ${SOCK_PATH}: ${error.message}`);
   });
+  // Unlock the vault at startup instead of on first use. A sealed key with no
+  // reachable passphrase makes every operation fail; discovering that at the
+  // first credential request hides the cause behind a per-request error.
+  try {
+    getMasterKey().fill(0);
+  } catch (error) {
+    console.error(String(error?.message ?? error));
+    process.exit(1);
+  }
   // The Web UI is a convenience; the credential socket is the product.
   ensureSocketFree(SOCK_PATH).then(() => { server.listen(SOCK_PATH, () => console.log(`wellspringd listening on ${SOCK_PATH}`)); })
     .catch((error) => { console.error(String(error?.message ?? error)); process.exit(1); });

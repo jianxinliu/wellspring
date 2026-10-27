@@ -9,7 +9,9 @@ export const HTTP_PORT = Number(process.env.WELLSPRING_HTTP_PORT ?? 7777);
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const READ_OPS = new Set(["ping", "list", "describe", "view", "policy_get", "audit", "auth_check"]);
-const WRITE_OPS = new Set(["put", "delete", "policy_put", "resolve", "draw_env", "draw", "auth_issue_oneshot"]);
+const WRITE_OPS = new Set(["put", "delete", "policy_put", "resolve", "draw_env", "draw", "auth_issue_oneshot",
+  // Derived operations need the admin token too: a signature oracle is still an oracle.
+  "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt"]);
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -306,6 +308,9 @@ function showUsage(button) {
     ['CLI · 模板配置', "wellspring exec --template-file 'APP_CONFIG=<template-path>' -- '<program>' '<arg>'"],
     ['MCP · 模板配置', JSON.stringify({name:'wellspring_exec',arguments:{templates:{APP_CONFIG:'{"secret": {{' + ref + ' | json}}}'},command:['<program>','<arg>'],output:'none'}},null,2)],
     ['MCP · tools/call JSON', JSON.stringify({name:'wellspring_exec',arguments:{env:{APP_SECRET:ref},command:['<program>','<arg>'],output:'none'}}, null, 2)],
+    ['MCP · 短时验证码 TOTP（字段需为 base32 种子）', JSON.stringify({name:'wellspring_derive',arguments:{op:'totp',ref}}, null, 2)],
+    ['MCP · 签名（字段需为 HMAC 密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'hmac',ref,data:'<待签名内容>',alg:'sha256'}}, null, 2)],
+    ['MCP · 加密（字段需为 base64 32 字节密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'encrypt',ref,plaintext:'<明文>'}}, null, 2)],
   ];
   const row = document.createElement('tr'); row.id = 'usage-panel';
   const cell = document.createElement('td'); cell.colSpan = 8; cell.className = 'usage-panel';
@@ -402,12 +407,17 @@ async function addPut() {
 
 async function renderPolicy() {
   const r = await api('policy_get'); S.policy=r.policy;
-  document.getElementById('app').innerHTML='<div class="card"><h2>个人信息访问策略</h2><p>只有白名单中的业务原因能够请求明文解析。限速按字段计算。</p><div class="kv"><label for="p-reasons">允许原因（逗号分隔）</label><input id="p-reasons"><label for="p-rate">每分钟最多解析次数</label><input id="p-rate" type="number" min="1" max="10000"></div><div class="row"><button onclick="savePolicy()">保存策略</button></div></div>';
+  if (!S.policy.exec) S.policy.exec={enabled:false,allow:[],deny:[]};
+  document.getElementById('app').innerHTML='<div class="card"><h2>个人信息访问策略</h2><p>只有白名单中的业务原因能够请求明文解析。限速按字段计算。</p><div class="kv"><label for="p-reasons">允许原因（逗号分隔）</label><input id="p-reasons"><label for="p-rate">每分钟最多解析次数</label><input id="p-rate" type="number" min="1" max="10000"></div></div><div class="card"><h2>访问控制</h2><p>命令规则每行一条，支持引号。* 匹配一个参数，末尾的 ** 匹配任意数量参数；拒绝规则优先。</p><label><input id="p-exec-enabled" type="checkbox"> 启用目标命令白名单</label><div class="kv"><label for="p-exec-allow">允许命令</label><textarea id="p-exec-allow" rows="6" placeholder="node app.js"></textarea><label for="p-exec-deny">拒绝命令</label><textarea id="p-exec-deny" rows="6"></textarea></div><div class="row"><button onclick="savePolicy()">保存策略</button></div></div>';
   document.getElementById('p-reasons').value=r.policy.resolveReasons.join(', ');
   document.getElementById('p-rate').value=r.policy.resolveRatePerMin;
+  document.getElementById('p-exec-enabled').checked=S.policy.exec.enabled ?? true;
+  document.getElementById('p-exec-allow').value=(S.policy.exec.allow ?? []).join('\\n');
+  document.getElementById('p-exec-deny').value=(S.policy.exec.deny ?? []).join('\\n');
 }
 async function savePolicy() {
-  const policy={resolveReasons:document.getElementById('p-reasons').value.split(',').map(s=>s.trim()).filter(Boolean),resolveRatePerMin:Number(document.getElementById('p-rate').value)};
+  const lines=id=>document.getElementById(id).value.split('\\n').map(s=>s.trim()).filter(Boolean);
+  const policy={...S.policy,resolveReasons:document.getElementById('p-reasons').value.split(',').map(s=>s.trim()).filter(Boolean),resolveRatePerMin:Number(document.getElementById('p-rate').value),exec:{enabled:document.getElementById('p-exec-enabled').checked,allow:lines('p-exec-allow'),deny:lines('p-exec-deny')}};
   await api('policy_put',{policy}); notify('策略已保存');
 }
 
