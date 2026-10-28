@@ -22,6 +22,10 @@ function adminToken(): string | undefined {
   try { return readFileSync(ADMIN_TOKEN_PATH, "utf8").trim(); } catch { return undefined; }
 }
 
+function clientToken(): string | undefined {
+  return process.env.WELLSPRING_CLIENT_TOKEN || adminToken();
+}
+
 function rpc(msg: object): Promise<any> {
   return new Promise((resolve, reject) => {
     const sock = connect(SOCK_PATH);
@@ -46,6 +50,25 @@ function rpc(msg: object): Promise<any> {
 
 const TOOLS = [
   {
+    name: "wellspring_request",
+    description: "Request a credential from the user through Wellspring's separate Web form. Returns a request ID and expiry; use wellspring_request_status to obtain its ref after the user fills it. Never put a secret value in this tool.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {
+      label: { type: "string", maxLength: 256, description: "What credential is needed, e.g. GitHub release token" },
+      purpose: { type: "string", maxLength: 512, description: "Task purpose; reuse this exact value when delivering the fulfilled ref" },
+      target: { type: "string", maxLength: 512, description: "Intended destination; an intent claim, not verified network isolation" },
+      channel: { type: "string", enum: ["A1/exec", "A2/fd", "C1/file", "C1/template", "git/askpass", "ssh/askpass", "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt"] },
+      ttlMs: { type: "integer", minimum: 1000, maximum: 86400000, description: "Request expiry, default 15 minutes; temporary credentials expire with the request" },
+    }, required: ["label", "purpose", "channel"] },
+  },
+  {
+    name: "wellspring_request_status",
+    description: "Check or cancel your credential request. Returns pending, fulfilled, cancelled or expired; fulfilled includes a ref, never its value. While pending, wait for the user instead of repeatedly polling.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {
+      requestId: { type: "string" },
+      cancel: { type: "boolean", description: "Default false; true cancels the request" },
+    }, required: ["requestId"] },
+  },
+  {
     name: "wellspring_list",
     description: "List all sensitive-info descriptors this agent may use. Returns refs (secret://...), field fingerprints, where a field is backed by an external source (source, e.g. env:NAME — a label only, never a value), expiry (expiresAt/expired) and available recipes. NEVER returns plaintext.",
     inputSchema: { type: "object", properties: { tag: { type: "string" } } },
@@ -66,6 +89,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        purpose: { type: "string", description: "Declared task purpose; must match the credential's use policy when restricted" },
+        target: { type: "string", description: "Declared intended destination; must match policy, does not enforce network routing" },
         env: { type: "object", additionalProperties: { type: "string" }, description: "ENV_VAR -> secret://id/field mapping" },
         fd: { type: 'object', additionalProperties: {type:'string'}, description: 'NAME -> ref; child reads descriptor number from WELLSPRING_FD_NAME' },
         files: { type: 'object', additionalProperties: {type:'string'}, description: 'ENV_VAR -> ref; child receives a temporary 0600 file path, removed after exit' },
@@ -89,6 +114,8 @@ const TOOLS = [
           enum: ["totp", "hmac", "encrypt", "decrypt"],
           description: "totp = 2FA code; hmac = sign a string; encrypt/decrypt = AES-256-GCM ",
         },
+        purpose: { type: "string", description: "Declared task purpose required by the credential's use policy" },
+        target: { type: "string", description: "Declared intended destination required by the use policy" },
         ref: { type: "string", description: "secret://id/field holding the key. totp wants a base32 seed; hmac wants the raw secret; aes wants a base64 32-byte key" },
         data: { type: "string", description: "hmac only: the exact string to sign, at most 1 MiB" },
         plaintext: { type: "string", description: "encrypt only: the text to encrypt, at most 1 MiB" },
@@ -104,12 +131,20 @@ const TOOLS = [
 
 async function callTool(name: string, args: any): Promise<string> {
   switch (name) {
+    case "wellspring_request": {
+      if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some(k => !['label','purpose','target','channel','ttlMs'].includes(k))) throw new Error('invalid request arguments; enter values only in the separate Web form');
+      return JSON.stringify(await rpc({ ...args, op: 'request_create', token: clientToken() }));
+    }
+    case "wellspring_request_status": {
+      if (!args || typeof args.requestId !== 'string' || (args.cancel !== undefined && typeof args.cancel !== 'boolean')) throw new Error('invalid request status arguments');
+      return JSON.stringify(await rpc({ op: args.cancel ? 'request_cancel' : 'request_status', requestId: args.requestId, token: clientToken() }));
+    }
     case "wellspring_list": {
-      const r = await rpc({ op: "list", tag: args?.tag });
+      const r = await rpc({ op: "list", tag: args?.tag, token: clientToken() });
       return JSON.stringify(r.descriptors, null, 2);
     }
     case "wellspring_describe": {
-      const r = await rpc({ op: "describe", id: args.id });
+      const r = await rpc({ op: "describe", id: args.id, token: clientToken() });
       return JSON.stringify(r, null, 2);
     }
     case "wellspring_exec": {
@@ -136,31 +171,33 @@ async function callTool(name: string, args: any): Promise<string> {
       if (!policyReply?.policy || typeof policyReply.policy !== 'object' || Array.isArray(policyReply.policy)) throw new Error('invalid exec policy response');
       const decision = checkExecAllowed(parseExecGuard(policyReply.policy.exec), command);
       if (!decision.allowed) throw new Error(decision.reason);
+      const context = { purpose: args.purpose, target: args.target };
+      for (const value of Object.values(context)) if (value !== undefined && (typeof value !== 'string' || !value.trim() || value.length > 512)) throw new Error('purpose and target must be nonempty strings of at most 512 characters');
       const templatePlans = Object.entries(templates).map(([name,text])=>({name,parts:parseTemplate(text as string)}));
       const tempDirs: string[] = [];
       try {
-      const { env: secretEnv } = await rpc({ op: 'draw_env', env, token: adminToken() });
+      const { env: secretEnv } = await rpc({ op: 'draw_env', env, token: clientToken(), ...context });
       const values = Object.values(secretEnv) as string[];
       const fdValues: string[] = [];
       const childEnv = { ...process.env, ...secretEnv };
       for (const [name,ref] of Object.entries(fd)) {
-        const {value} = await rpc({op:'draw',ref,channel:'A2/fd',token:adminToken()});
+        const {value} = await rpc({op:'draw',ref,channel:'A2/fd',token:clientToken(),...context});
         values.push(value); fdValues.push(value);
         childEnv[`WELLSPRING_FD_${name}`] = String(2+fdValues.length);
       }
       for (const [name,ref] of Object.entries(files)) {
-        const {value} = await rpc({op:'draw',ref,channel:'C1/file',token:adminToken()});
+        const {value} = await rpc({op:'draw',ref,channel:'C1/file',token:clientToken(),...context});
         values.push(value);
         const dir=mkdtempSync(join(tmpdir(),'ws-mcp-file-')); tempDirs.push(dir);
         const path=join(dir,name); writeFileSync(path,value,{mode:0o600}); childEnv[name]=path;
       }
       for (const {name,parts} of templatePlans) {
-        const rendered = await renderTemplate(parts,async ref => (await rpc({op:'draw',ref,channel:'C1/template',token:adminToken()})).value);
+        const rendered = await renderTemplate(parts,async ref => (await rpc({op:'draw',ref,channel:'C1/template',token:clientToken(),...context})).value);
         values.push(...rendered.sensitive);
         const dir=mkdtempSync(join(tmpdir(),'ws-mcp-file-'));tempDirs.push(dir);
         const path=join(dir,name);writeFileSync(path,rendered.text,{mode:0o600});childEnv[name]=path;
       }
-      for (const key of ['WELLSPRING_ADMIN_TOKEN','WELLSPRING_KEY','WELLSPRING_ONESHOT']) delete childEnv[key];
+      for (const key of ['WELLSPRING_ADMIN_TOKEN','WELLSPRING_CLIENT_TOKEN','WELLSPRING_KEY','WELLSPRING_ONESHOT','WELLSPRING_PASSPHRASE','WELLSPRING_PASSPHRASE_FILE']) delete childEnv[key];
       const redact = (text: string) => values.filter(Boolean).sort((a,b)=>b.length-a.length).reduce((s,v)=>s.split(v).join('[REDACTED]'), text);
       // Retain only bounded decoded prefixes. Redact BEFORE truncating the returned string.
       const captures = [{ text:'', decoder:new StringDecoder('utf8'), truncated:false }, { text:'', decoder:new StringDecoder('utf8'), truncated:false }];
@@ -205,7 +242,7 @@ async function callTool(name: string, args: any): Promise<string> {
       if (op === "encrypt" && typeof plaintext !== "string") throw new Error("encrypt requires a plaintext string");
       if (op === "decrypt" && typeof blob !== "string") throw new Error("decrypt requires a base64 blob string");
       // The daemon decides: it holds the key, so the key never crosses the socket.
-      const r = await rpc({ op: `derive_${op}`, ref, data, plaintext, blob, alg, digits, period, token: adminToken() });
+      const r = await rpc({ op: `derive_${op}`, ref, data, plaintext, blob, alg, digits, period, purpose: args.purpose, target: args.target, token: clientToken() });
       // A derived artefact is safe to return by design, but the key is not.
       const text = JSON.stringify(r);
       return text;

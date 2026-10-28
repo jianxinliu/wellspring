@@ -3,6 +3,7 @@
  * Store: JSON file, values encrypted with AES-256-GCM.
  * Master key: from env WELLSPRING_KEY (base64) or keyfile ~/.wellspring/master.key
  */
+import { validateUsePolicy, type UsePolicy } from "../policy/access.ts";
 import { gcm } from "@noble/ciphers/aes";
 import { randomBytes, scryptSync } from "node:crypto";
 import { obtainPassphrase, SEALED_KEY_ERROR } from "./custody.ts";
@@ -111,6 +112,7 @@ export type Field = {
   source?: Source;
   class: Class;
   mask?: string; // for pii: keep1 | phone | region | none
+  usePolicy?: UsePolicy;
   expiresAt?: number; // epoch ms; after this instant the daemon refuses to draw the value
 };
 
@@ -214,7 +216,7 @@ function descriptorFingerprint(f: Field): string {
  */
 const EXTERNAL_PREVIEW = "（外部来源，未读取）";
 
-export function putSecret(id: string, field: string, plaintext: string, opts?: { cls?: Class; mask?: string; tags?: string[]; ttlMs?: number; expiresAt?: number }) {
+export function putSecret(id: string, field: string, plaintext: string, opts?: { cls?: Class; mask?: string; tags?: string[]; ttlMs?: number; expiresAt?: number; usePolicy?: UsePolicy }) {
   validateKey(id, "id");
   validateKey(field, "field");
   if (typeof plaintext !== "string" || !plaintext.length || Buffer.byteLength(plaintext, "utf8") > 1024 * 1024) {
@@ -227,6 +229,7 @@ export function putSecret(id: string, field: string, plaintext: string, opts?: {
     Array.from(opts.tags).some((tag) => typeof tag !== "string" || !tag.trim() || tag.length > 128 || /[\u0000-\u001f\u007f]/u.test(tag)))) {
     throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
   }
+  const usePolicy = opts?.usePolicy === undefined ? undefined : validateUsePolicy(opts.usePolicy);
   const expiresAt = resolveExpiry(opts);
   const s = loadStore();
   if (!hasOwn(s.entries, id)) s.entries[id] = { id, type: id.startsWith("person:") ? "person" : "credential", fields: Object.create(null) };
@@ -238,6 +241,7 @@ export function putSecret(id: string, field: string, plaintext: string, opts?: {
   };
   // An omitted expiry explicitly makes the replacement permanent.
   if (expiresAt !== undefined) stored.expiresAt = expiresAt;
+  stored.usePolicy = usePolicy ?? s.entries[id].fields[field]?.usePolicy;
   s.entries[id].fields[field] = stored;
   if (opts?.tags) s.entries[id].tags = opts.tags;
   saveStore(s);
@@ -247,7 +251,7 @@ export function putSecret(id: string, field: string, plaintext: string, opts?: {
  * Bind a field to an external source. Nothing is copied: the ciphertext slot is
  * cleared so the store cannot hold a stale copy of a secret it no longer owns.
  */
-export function putSource(id: string, field: string, spec: unknown, opts?: { cls?: Class; mask?: string; tags?: string[]; ttlMs?: number; expiresAt?: number }) {
+export function putSource(id: string, field: string, spec: unknown, opts?: { cls?: Class; mask?: string; tags?: string[]; ttlMs?: number; expiresAt?: number; usePolicy?: UsePolicy }) {
   validateKey(id, "id");
   validateKey(field, "field");
   const source = parseSource(spec);
@@ -258,6 +262,7 @@ export function putSource(id: string, field: string, spec: unknown, opts?: { cls
     Array.from(opts.tags).some((tag) => typeof tag !== "string" || !tag.trim() || tag.length > 128 || /[\u0000-\u001f\u007f]/u.test(tag)))) {
     throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
   }
+  const usePolicy = opts?.usePolicy === undefined ? undefined : validateUsePolicy(opts.usePolicy);
   const expiresAt = resolveExpiry(opts);
   // Fail fast: a reference that cannot be read on day one is almost always a
   // typo in a path or variable name, and finding that out at draw time is worse.
@@ -267,6 +272,7 @@ export function putSource(id: string, field: string, spec: unknown, opts?: { cls
   const cls = opts?.cls ?? s.entries[id].fields[field]?.class ?? (id.startsWith("person:") ? "pii" : "credential");
   const stored: Field = { source, class: cls, mask: opts?.mask ?? s.entries[id].fields[field]?.mask };
   if (expiresAt !== undefined) stored.expiresAt = expiresAt;
+  stored.usePolicy = usePolicy ?? s.entries[id].fields[field]?.usePolicy;
   s.entries[id].fields[field] = stored;
   if (opts?.tags) s.entries[id].tags = opts.tags;
   saveStore(s);
@@ -283,6 +289,7 @@ export function adoptSource(id: string, field: string): void {
   const plaintext = readSource(f.source);
   const stored: Field = { value: encrypt(getMasterKey(), Buffer.from(plaintext, "utf8")), class: f.class, mask: f.mask };
   if (f.expiresAt !== undefined) stored.expiresAt = f.expiresAt;
+  if (f.usePolicy !== undefined) stored.usePolicy = f.usePolicy;
   s.entries[id].fields[field] = stored;
   saveStore(s);
 }
@@ -351,7 +358,7 @@ export function mask(plaintext: string, mode?: string): string {
 /** Descriptor: everything an agent is allowed to see. Never contains plaintext. */
 export type Descriptor = {
   ref: string;
-  fields: { name: string; class: Class; mask?: string; fingerprint: string; source?: string; expiresAt?: number; expired?: boolean }[];
+  fields: { name: string; class: Class; mask?: string; fingerprint: string; source?: string; expiresAt?: number; expired?: boolean; usePolicy?: UsePolicy }[];
   recipes: { id: string; channel: string }[];
   tags: string[];
 };
@@ -360,8 +367,8 @@ export type Descriptor = {
  * Expiry projection for the agent-visible surfaces: a future expiry, or the flag
  * that it elapsed. Both keys are omitted for permanent credentials. No plaintext.
  */
-function expiryProjection(f: Field): { expiresAt?: number; expired?: boolean } {
-  return f.expiresAt === undefined ? {} : { expiresAt: f.expiresAt, expired: Date.now() >= f.expiresAt };
+function expiryProjection(f: Field): { expiresAt?: number; expired?: boolean; usePolicy?: UsePolicy } {
+  return { ...(f.usePolicy ? { usePolicy: f.usePolicy } : {}), ...(f.expiresAt === undefined ? {} : { expiresAt: f.expiresAt, expired: Date.now() >= f.expiresAt }) };
 }
 
 const BUILTIN_RECIPES = [
@@ -372,13 +379,13 @@ const BUILTIN_RECIPES = [
 function availableRecipes(entry: Entry): Descriptor['recipes'] {
   return [...BUILTIN_RECIPES,...(entry.recipes ?? []).map(({id,channel})=>({id,channel}))];
 }
-export function listDescriptors(filter?: { tag?: string }): Descriptor[] {
+export function listDescriptors(filter?: { tag?: string }, visible: (f: Field) => boolean = () => true): Descriptor[] {
   const s = loadStore();
   return Object.values(s.entries)
     .filter((e) => !filter?.tag || (e.tags ?? []).includes(filter.tag))
     .map((e) => ({
       ref: `secret://${e.id}`,
-      fields: Object.entries(e.fields).map(([name, f]) => ({
+      fields: Object.entries(e.fields).filter(([, f]) => visible(f)).map(([name, f]) => ({
         name,
         class: f.class,
         mask: f.mask,
@@ -388,10 +395,10 @@ export function listDescriptors(filter?: { tag?: string }): Descriptor[] {
       })),
       recipes: availableRecipes(e),
       tags: e.tags ?? [],
-    }));
+    })).filter(e => e.fields.length > 0);
 }
 
-export function describe(id: string): Descriptor & { maskedPreview: Record<string, string> } {
+export function describe(id: string, visible: (f: Field) => boolean = () => true): Descriptor & { maskedPreview: Record<string, string> } {
   validateKey(id, "id");
   const s = loadStore();
   const e = hasOwn(s.entries, id) ? s.entries[id] : undefined;
@@ -399,6 +406,7 @@ export function describe(id: string): Descriptor & { maskedPreview: Record<strin
   const masked: Record<string, string> = Object.create(null);
   const fields: Descriptor["fields"] = [];
   for (const [name, f] of Object.entries(e.fields)) {
+    if (!visible(f)) continue;
     if (f.source) {
       // Describing must never read an external source: that would be a draw.
       masked[name] = EXTERNAL_PREVIEW;
@@ -409,6 +417,7 @@ export function describe(id: string): Descriptor & { maskedPreview: Record<strin
     masked[name] = f.class === "credential" ? "****" : mask(pt, f.mask);
     fields.push({ name, class: f.class, mask: f.mask, fingerprint: fingerprint(pt), ...expiryProjection(f) });
   }
+  if (!fields.length) throw new Error(`no such entry: ${id}`);
   return {
     ref: `secret://${e.id}`,
     fields,
@@ -416,4 +425,19 @@ export function describe(id: string): Descriptor & { maskedPreview: Record<strin
     tags: e.tags ?? [],
     maskedPreview: masked,
   };
+}
+
+/** Metadata-only lookup: never decrypts or contacts an external source. */
+export function getField(id: string, field: string): Field {
+  validateKey(id, "id"); validateKey(field, "field");
+  const s = loadStore();
+  const f = hasOwn(s.entries, id) && hasOwn(s.entries[id].fields, field) ? s.entries[id].fields[field] : undefined;
+  if (!f) throw new Error(`no such secret: ${id}/${field}`);
+  return f;
+}
+export function hasEntry(id: string): boolean { validateKey(id, "id"); return hasOwn(loadStore().entries, id); }
+export function setUsePolicy(id: string, field: string, policy: UsePolicy): void {
+  const validated = validateUsePolicy(policy);
+  getField(id, field);
+  const s = loadStore(); s.entries[id].fields[field].usePolicy = validated; saveStore(s);
 }

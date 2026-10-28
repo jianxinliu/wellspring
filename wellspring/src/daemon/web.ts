@@ -8,10 +8,10 @@ import { handle } from "./main.ts";
 export const HTTP_PORT = Number(process.env.WELLSPRING_HTTP_PORT ?? 7777);
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const READ_OPS = new Set(["ping", "list", "describe", "view", "policy_get", "audit", "auth_check"]);
+const READ_OPS = new Set(["ping", "list", "describe", "view", "policy_get", "audit", "auth_check", "request_list"]);
 const WRITE_OPS = new Set(["put", "put_source", "adopt", "delete", "policy_put", "resolve", "draw_env", "draw", "auth_issue_oneshot",
   // Derived operations need the admin token too: a signature oracle is still an oracle.
-  "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt"]);
+  "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt", "request_fulfill", "request_cancel", "access_put"]);
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -157,12 +157,12 @@ const HTML = `<!doctype html>
   .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--dim); }
   button { background:var(--card); color:var(--fg); border:1px solid var(--line); padding:7px 12px; border-radius:8px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
-  button:focus-visible,input:focus-visible,select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .danger { color:var(--red); }
   .notice { padding:10px; color:var(--green); min-height:40px; }
   .table-wrap { overflow-x:auto; }
   @media(max-width:640px) { header { flex-wrap:wrap; padding:12px; } nav { flex-wrap:wrap; margin:0; } main { padding:12px; } .kv { grid-template-columns:1fr; } }
-  input,select { background:var(--bg); border:1px solid var(--line); color:var(--fg); padding:6px 10px; border-radius:8px; font-size:13px; }
+  input,select,textarea { background:var(--bg); border:1px solid var(--line); color:var(--fg); padding:6px 10px; border-radius:8px; font-size:13px; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
   #login { max-width:420px; margin:80px auto; text-align:center; }
   #login .hint { color:var(--dim); font-size:12px; margin-top:10px; }
@@ -179,6 +179,10 @@ const HTML = `<!doctype html>
   .usage-panel pre { white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0; padding:10px; background:var(--bg); }
   .usage-panel p { color:var(--dim); }
   .usage-panel button { margin-bottom:12px; }
+  textarea { width:100%; resize:vertical; }
+  .request-choice { display:block; margin:10px 0; }
+  .request-actions { margin-top:16px; }
+  button:disabled { opacity:.5; cursor:default; }
 </style>
 </head>
 <body>
@@ -195,6 +199,7 @@ const HTML = `<!doctype html>
   <h1><img src="/favicon.svg" alt="" width="22" height="22" style="vertical-align:-4px;margin-right:8px">Wellspring <span>· 凭证井</span></h1>
   <nav>
     <button id="tab-vault" onclick="show('vault')">凭据库</button>
+    <button id="tab-requests" onclick="show('requests')">待填写</button>
     <button id="tab-audit" onclick="show('audit')">使用记录</button>
     <button id="tab-stats" onclick="show('stats')">概览</button>
     <button id="tab-policy" onclick="show('policy')">设置</button>
@@ -203,7 +208,9 @@ const HTML = `<!doctype html>
 </header>
 <main id="app" style="display:none"></main>
 <script>
-const S = { token: sessionStorage.wst ?? "", tab: "vault", entries: [], events: [], policy: {} };
+const requestedId = new URLSearchParams(location.search).get('request');
+const S = { token: sessionStorage.wst ?? "", authenticated:false, tab: requestedId ? "requests" : "vault", entries: [], events: [], policy: {}, requests:[], requestId:requestedId, requestBusy:false, requestLoading:false };
+let requestTimer;
 
 async function api(op, body = {}) {
   const r = await fetch("/api/" + op, {
@@ -212,7 +219,13 @@ async function api(op, body = {}) {
     body: JSON.stringify(body),
   });
   const result = await r.json();
-  if (result.error) throw new Error(result.error);
+  if (r.status === 401) {
+    S.authenticated = false; clearInterval(requestTimer); S.token = ''; sessionStorage.removeItem('wst');
+    document.getElementById('app').innerHTML = ''; document.getElementById('app').style.display = 'none';
+    document.getElementById('appbar').style.display = 'none'; document.getElementById('login').style.display = 'block';
+    throw new Error('登录已失效，请重新登录');
+  }
+  if (!r.ok || result.error) throw new Error(result.error || '请求失败');
   return result;
 }
 function notify(message, failed = false) {
@@ -231,6 +244,10 @@ function login() {
 }
 function logout() { sessionStorage.removeItem("wst"); location.reload(); }
 function enter() {
+  S.authenticated = true; document.getElementById('tok-in').value = '';
+  clearInterval(requestTimer);
+  requestTimer = setInterval(() => { if (S.authenticated) refreshRequests().catch(() => {}); }, 5000);
+  refreshRequests().catch(() => {});
   document.getElementById("login").style.display = "none";
   document.getElementById("appbar").style.display = "flex";
   document.getElementById("app").style.display = "block";
@@ -239,8 +256,9 @@ function enter() {
 
 function show(tab) {
   S.tab = tab;
-  for (const t of ["vault", "audit", "stats", "policy"]) document.getElementById("tab-" + t).classList.toggle("active", t === tab);
+  for (const t of ["vault", "requests", "audit", "stats", "policy"]) document.getElementById("tab-" + t).classList.toggle("active", t === tab);
   if (tab === "vault") renderVault();
+  if (tab === "requests") renderRequests();
   if (tab === "audit") renderAudit();
   if (tab === "stats") renderStats();
   if (tab === "policy") renderPolicy();
@@ -274,6 +292,162 @@ function expiryBadge(f) {
     esc(fmtDuration(left)) + "</span>";
 }
 
+// ---------- independent human input requests ----------
+function requestStatus(r) {
+  return r.status === 'pending' && new Date(r.expiresAt).getTime() <= Date.now() ? 'expired' : r.status;
+}
+function requestStatusLabel(status) {
+  return ({pending:'待填写', fulfilled:'已填写', cancelled:'已取消', expired:'已过期'})[status] || '状态未知';
+}
+async function refreshRequests() {
+  if (!S.authenticated || S.requestLoading) return;
+  S.requestLoading = true;
+  try {
+    const r = await api('request_list');
+    if (!S.authenticated) return;
+    S.requests = r.requests ?? [];
+    const count = S.requests.filter(r => requestStatus(r) === 'pending').length;
+    document.getElementById('tab-requests').textContent = '待填写' + (count ? ' (' + count + ')' : '');
+    if (S.tab === 'requests') drawRequests();
+  } finally { S.requestLoading = false; }
+}
+function renderRequests() {
+  document.getElementById('app').innerHTML = '<div class="card"><h2>待填写</h2><p class="hint">在此页面直接向本地凭据服务填写，内容不会进入模型对话。默认仅供本次任务使用。</p><div id="request-list"></div></div><div id="request-detail"></div>';
+  drawRequests();
+  refreshRequests().catch(() => notify('刷新请求失败，请稍后重试', true));
+}
+function drawRequests() {
+  const list = document.getElementById('request-list');
+  const detail = document.getElementById('request-detail');
+  if (!list || !detail) return;
+  list.replaceChildren();
+  const ordered = [...S.requests].sort((a,b) => Number(requestStatus(b) === 'pending') - Number(requestStatus(a) === 'pending'));
+  for (const r of ordered) {
+    const button = document.createElement('button');
+    button.textContent = (r.label || r.requestId) + ' · ' + requestStatusLabel(requestStatus(r));
+    button.style.margin = '4px'; button.disabled = S.requestBusy;
+    button.onclick = () => {
+      if (S.requestId !== r.requestId) { S.requestId = r.requestId; detail.replaceChildren(); delete detail.dataset.requestId; delete detail.dataset.status; }
+      const url = new URL(location.href); url.searchParams.set('request', r.requestId); history.replaceState(null, '', url);
+      drawRequests();
+    };
+    list.appendChild(button);
+  }
+  if (!ordered.length) list.textContent = '暂无填写请求。';
+  const r = S.requests.find(r => r.requestId === S.requestId);
+  if (!r) {
+    detail.textContent = S.requestId ? '未找到此请求，可能已清理。请检查链接或选择其他请求。' : '选择一个请求查看详情并填写。';
+    return;
+  }
+  const status = requestStatus(r);
+  // Leave the live form intact during polling. Never keep secret drafts in state/storage.
+  if (detail.dataset.requestId === r.requestId && detail.dataset.status === status) return;
+  detail.dataset.requestId = r.requestId; detail.dataset.status = status;
+  detail.innerHTML = '<div class="card"><h2>' + esc(r.label || '填写凭据') + '</h2><div class="kv">' +
+    '<b>用途</b><span>' + esc(r.purpose) + '</span><b>目标</b><span>' + esc(r.target || '未声明') + '</span>' +
+    '<b>调用方</b><span>' + esc(r.caller) + '</span><b>通道</b><span>' + esc(r.channel) + '</span>' +
+    '<b>到期时间</b><span>' + esc(fmtTs(r.expiresAt)) + '</span><b>状态</b><span>' + esc(requestStatusLabel(status)) + '</span></div>' +
+    '<p class="hint">用途和目标由调用方声明，并不代表已验证实际使用目的或网络目的地。</p>' +
+    (status === 'pending' ? '<form id="request-form"><label for="request-value">请填写 ' + esc(r.label || '凭据值') + '</label>' +
+      '<input id="request-value" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" style="display:block;width:100%" required>' +
+      '<label class="request-choice"><input id="request-visible" type="checkbox"> 显示输入内容（支持多行）</label>' +
+      '<label class="request-choice"><input type="radio" name="request-save" value="once" checked> 仅本次任务</label>' +
+      '<label class="request-choice"><input type="radio" name="request-save" value="save"> 保存供以后使用</label>' +
+      '<div id="request-save-options" hidden><label for="request-name">保存名称（可选）</label><input id="request-name" placeholder="例如 github_token"><label for="request-field">字段名（可选）</label><input id="request-field" placeholder="默认 value"></div>' +
+      '<div class="row request-actions"><button type="submit">提交凭据</button><button type="button" id="request-cancel" class="danger">取消请求</button></div></form>' :
+      '<p>' + esc(status === 'expired' ? '请求已过期，请调用方重新发起。' : status === 'cancelled' ? '请求已取消。' : '已完成填写，输入内容已清空。') + '</p>' +
+      (r.ref ? '<p class="mono">' + esc(r.ref) + '</p>' : '')) + '</div>';
+  if (status !== 'pending') return;
+  const form = document.getElementById('request-form');
+  form.onsubmit = e => { e.preventDefault(); fulfillRequest(r.requestId); };
+  document.getElementById('request-visible').onchange = e => {
+    const input = document.getElementById('request-value');
+    // A native password control protects the default value from accessibility
+    // snapshots as well as screen display. Multiline entry requires explicit reveal.
+    const next = document.createElement(e.target.checked ? 'textarea' : 'input');
+    if (!e.target.checked) next.type = 'password'; else next.rows = 4;
+    if (!e.target.checked && /[\\r\\n]/.test(input.value)) {
+      notify('多行内容保持显示直至提交，以免隐藏时丢失换行'); e.target.checked = true; return;
+    }
+    next.id = input.id; next.value = input.value; next.required = true; next.autocomplete = 'off'; next.spellcheck = false;
+    next.style.cssText = 'display:block;width:100%'; input.value = ''; input.replaceWith(next); next.focus();
+  };
+  form.querySelectorAll('[name="request-save"]').forEach(input => input.onchange = () => {
+    document.getElementById('request-save-options').hidden = form.querySelector('[name="request-save"]:checked').value !== 'save';
+  });
+  document.getElementById('request-cancel').onclick = () => cancelRequest(r.requestId);
+}
+function requestBusy(busy) {
+  S.requestBusy = busy;
+  document.querySelectorAll('#request-form button,#request-list button').forEach(b => b.disabled = busy);
+}
+async function fulfillRequest(requestId) {
+  if (S.requestBusy) return;
+  const input = document.getElementById('request-value');
+  if (!input || !input.value) { notify('请填写凭据值', true); return; }
+  const save = document.querySelector('[name="request-save"]:checked').value === 'save';
+  const body = {requestId, value:input.value, save};
+  if (save) {
+    const name = document.getElementById('request-name').value.trim();
+    const field = document.getElementById('request-field').value.trim();
+    body.id = name ? normalizeId(name, 'credential') : 'cred:request_' + requestId;
+    if (field) body.field = field;
+  }
+  requestBusy(true);
+  try {
+    const result = await api('request_fulfill', body);
+    if (result.status !== 'fulfilled') throw new Error('request not fulfilled');
+    input.value = ''; body.value = '';
+    const r = S.requests.find(r => r.requestId === requestId);
+    if (r) { r.status = 'fulfilled'; r.ref = result.ref; }
+    notify(save ? '已提交并保存供以后使用' : '已提交，仅本次任务可用');
+    drawRequests(); await refreshRequests();
+  } catch {
+    // Do not surface server diagnostics that could accidentally include input values.
+    notify('提交未完成，请检查请求状态后重试', true); await refreshRequests().catch(() => {});
+  } finally { body.value = ''; requestBusy(false); }
+}
+async function cancelRequest(requestId) {
+  if (S.requestBusy) return;
+  requestBusy(true);
+  try {
+    const result = await api('request_cancel', {requestId});
+    if (result.status !== 'cancelled') throw new Error('request not cancelled');
+    const input = document.getElementById('request-value'); if (input) input.value = '';
+    const r = S.requests.find(r => r.requestId === requestId); if (r) r.status = 'cancelled';
+    notify('已取消请求'); drawRequests(); await refreshRequests();
+  } catch { notify('取消未完成，请刷新请求状态后重试', true); }
+  finally { requestBusy(false); }
+}
+
+// ---------- field use constraints ----------
+function showAccess(index, fieldIndex) {
+  document.getElementById('access-form')?.remove();
+  const entry = S.entries[index], field = entry.fields[fieldIndex];
+  const box = document.createElement('form'); box.id = 'access-form'; box.className = 'card';
+  box.innerHTML = '<h2>使用范围 · ' + esc(entry.id + '/' + field.name) + '</h2><p class="hint">每行一项，填写准确名称；留空表示该项不限制。多个项目按列表匹配，不同范围同时生效。用途和目标是调用方声明的意图，不代表已经验证实际用途或网络目的地。</p>' +
+    '<div class="kv">' + [['callers','允许的调用方'],['channels','允许的通道'],['purposes','允许的用途'],['targets','允许的目标']].map(([key,label]) => '<label for="access-' + key + '">' + label + '</label><textarea id="access-' + key + '" rows="3" spellcheck="false"></textarea>').join('') +
+    '</div><div class="row request-actions"><button type="submit">保存使用范围</button><button type="button" id="access-close">取消</button></div>';
+  document.getElementById('app').prepend(box);
+  for (const key of ['callers','channels','purposes','targets']) document.getElementById('access-' + key).value = (field.usePolicy?.[key] ?? []).join('\\n');
+  document.getElementById('access-close').onclick = () => box.remove();
+  box.onsubmit = async e => {
+    e.preventDefault();
+    const usePolicy = {};
+    for (const key of ['callers','channels','purposes','targets']) {
+      const values = [...new Set(document.getElementById('access-' + key).value.split('\\n').map(s => s.trim()).filter(Boolean))];
+      if (values.length) usePolicy[key] = values;
+    }
+    const submit = box.querySelector('[type="submit"]'); submit.disabled = true;
+    try {
+      await api('access_put', {id:entry.id, field:field.name, usePolicy});
+      field.usePolicy = usePolicy; box.remove(); notify('已保存字段使用范围');
+    } catch { notify('保存未完成，请检查范围内容后重试', true); }
+    finally { submit.disabled = false; }
+  };
+  box.scrollIntoView({behavior:'smooth',block:'start'});
+}
+
 // ---------- vault ----------
 async function renderVault() {
   const app = document.getElementById("app");
@@ -300,11 +474,12 @@ function drawVault() {
           : esc(e.maskedPreview?.[f.name] ?? "****")) + "</td>" +
         "<td>" + expiryBadge(f) + "</td>" +
         (i === 0 ? '<td rowspan="' + e.fields.length + '">' + (e.tags ?? []).map(esc).join(", ") + "</td>" : "") +
-        '<td><button class="usage-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '" aria-expanded="false">使用</button> <button class="edit-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">轮换</button> <button class="danger delete-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">删除字段</button>' + (i === 0 ? ' <button class="danger delete-entry" data-entry="' + S.entries.indexOf(e) + '">删除条目</button>' : '') + '</td></tr>'
+        '<td><button class="usage-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '" aria-expanded="false">使用</button> <button class="access-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">使用范围</button> <button class="edit-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">轮换</button> <button class="danger delete-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">删除字段</button>' + (i === 0 ? ' <button class="danger delete-entry" data-entry="' + S.entries.indexOf(e) + '">删除条目</button>' : '') + '</td></tr>'
       ).join("");
     }).join("") + "</table>";
   el.className = 'table-wrap';
   el.querySelectorAll('.usage-field').forEach(b => b.onclick = () => showUsage(b));
+  el.querySelectorAll('.access-field').forEach(b => b.onclick = () => showAccess(Number(b.dataset.entry), Number(b.dataset.field)));
   el.querySelectorAll('.edit-field').forEach(b => b.onclick = () => showAdd(Number(b.dataset.entry), Number(b.dataset.field)));
   el.querySelectorAll('.delete-field,.delete-entry').forEach(b => b.onclick = () => deleteEntry(Number(b.dataset.entry), b.classList.contains('delete-field') ? Number(b.dataset.field) : undefined));
 }

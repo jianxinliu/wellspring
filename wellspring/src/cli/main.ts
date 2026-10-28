@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 /// Wellspring CLI: put / delete / list / describe / view / resolve / policy / audit / exec / derive / askpass
+/// + client-issue / request / request-status / request-cancel (scoped agents)
 /// exec = A1 (env) + A2 (fd) channels. Plaintext lives only in this process + child fds.
 import { connect } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -11,6 +12,7 @@ import { parseTemplate, renderTemplate, type TemplatePart } from "../core/templa
 import { parseExecGuard, checkExecAllowed } from "../policy/exec.ts";
 import { sealMasterKey, unsealMasterKey } from "../core/store.ts";
 import { obtainPassphrase, readKeychainPassphrase, storeKeychainPassphrase, removeKeychainPassphrase } from "../core/custody.ts";
+import { DELIVERY_CHANNELS } from "../policy/access.ts";
 
 const WS_HOME = process.env.WELLSPRING_HOME ?? join(process.env.HOME ?? "", ".wellspring");
 export const SOCK_PATH = process.env.WELLSPRING_SOCK ?? join(WS_HOME, "wellspringd.sock");
@@ -20,6 +22,17 @@ function adminToken(): string | undefined {
   if (process.env.WELLSPRING_ADMIN_TOKEN) return process.env.WELLSPRING_ADMIN_TOKEN;
   if (existsSync(ADMIN_TOKEN_PATH)) return readFileSync(ADMIN_TOKEN_PATH, "utf8").trim();
   return undefined;
+}
+
+/**
+ * Credential for every normal (non-management) operation. A scoped client bearer
+ * wins over the admin token: an agent that owns a client token must act as that
+ * client, never silently gain admin rights because the token file is readable.
+ * Management operations (put/delete/policy/audit/client-issue/...) call
+ * adminToken() directly and keep requiring the admin token.
+ */
+function clientToken(): string | undefined {
+  return process.env.WELLSPRING_CLIENT_TOKEN || adminToken();
 }
 
 function rpc(msg: object, signal?: AbortSignal): Promise<any> {
@@ -67,11 +80,39 @@ export function parseTtlMs(input: string): number {
   return n * scale;
 }
 
+type ExecContext = { purpose?: string; target?: string };
+
+/** Purpose/target are declared intent; the daemon matches them, it does not verify the destination. */
+function checkContext(context: ExecContext): ExecContext {
+  for (const [name, value] of Object.entries(context)) {
+    if (value === undefined) continue;
+    if (typeof value !== "string" || !value.trim() || value.length > 512 || /[\u0000-\u001f\u007f]/u.test(value)) {
+      throw new Error(`invalid --${name}: expected a nonempty single-line string of at most 512 characters`);
+    }
+  }
+  return context;
+}
+
 async function exec(rest: string[]): Promise<number> {
   const dash = rest.indexOf("--");
-  if (dash < 0) throw new Error("usage: exec [--secret NAME=ref] [--secret-fd NAME=ref] [--secret-file NAME=ref] [--template-file NAME=path] [--git-cred ref] -- <cmd...>");
+  if (dash < 0) throw new Error("usage: exec [--purpose P] [--target T] [--secret NAME=ref] [--secret-fd NAME=ref] [--secret-file NAME=ref] [--template-file NAME=path] [--git-cred ref] -- <cmd...>");
   const childArgs = rest.slice(dash + 1);
   if (!childArgs[0]) throw new Error("no command after --");
+  // Read the declared context first: it does not depend on credentials, and a
+  // malformed value must fail before any draw or temporary file.
+  let pendingPurpose: string | undefined;
+  let pendingTarget: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const flag = rest[i];
+    if (i >= dash) break;
+    if (flag === "--purpose" || flag === "--target") {
+      const value = rest[i + 1];
+      if (i + 1 >= dash || !value || value.startsWith("--")) throw new Error(`missing value for ${flag}`);
+      if (flag === "--purpose") pendingPurpose = value; else pendingTarget = value;
+      i++;
+    }
+  }
+  const context = checkContext({ purpose: pendingPurpose, target: pendingTarget });
   let policyReply;
   try { policyReply = await rpc({ op: "policy_get" }); }
   catch (error) {
@@ -91,13 +132,17 @@ async function exec(rest: string[]): Promise<number> {
   const names = new Set<string>();
   const envNames = new Set<string>();
   let gitCredRef: string | undefined;
-  for (let i = 0; i < dash; i += 2) {
+  for (let i = 0; i < dash; i++) {
     const flag = rest[i];
+    // Context flags are consumed above: only their value stands between the
+    // dash and the child command, and it is never a delivery mapping.
+    if (flag === "--purpose" || flag === "--target") { i++; continue; }
     if (!["--secret", "-s", "--secret-fd", "--secret-file", "--template-file", "--git-cred"].includes(flag)) {
       throw new Error(`unknown exec flag: ${flag}`);
     }
     const value = rest[i + 1];
-    if (i + 1 >= dash || !value || value.startsWith("-")) throw new Error(`missing value for ${flag}`);
+    i++;
+    if (value === undefined || !value || value.startsWith("-")) throw new Error(`missing value for ${flag}`);
     if (flag === "--git-cred") {
       if (gitCredRef !== undefined) throw new Error("duplicate --git-cred");
       gitCredRef = value;
@@ -162,7 +207,7 @@ async function exec(rest: string[]): Promise<number> {
   try {
     const fileEnv: Record<string, string> = Object.create(null);
     for (const { name, ref } of fileRefs) {
-      const { value } = await request({ op: "draw", ref, channel: "C1/file", token: adminToken() });
+      const { value } = await request({ op: "draw", ref, channel: "C1/file", token: clientToken(), ...context });
       checkInterrupted();
       const dir = mkdtempSync(join(tmpdir(), "ws-file-"));
       tempDirs.push(dir); // Register before any subsequent operation can throw.
@@ -172,7 +217,7 @@ async function exec(rest: string[]): Promise<number> {
     }
     for (const { name, parts } of templatePlans) {
       const rendered = await renderTemplate(parts, async (ref) => {
-        const draw = await request({ op: "draw", ref, channel: "C1/template", token: adminToken() });
+        const draw = await request({ op: "draw", ref, channel: "C1/template", token: clientToken(), ...context });
         if (typeof draw?.value !== "string") throw new Error(`no value returned for template reference ${ref}`);
         return draw.value;
       });
@@ -184,13 +229,15 @@ async function exec(rest: string[]): Promise<number> {
       fileEnv[name] = path;
     }
     const { env: secretEnv } = Object.keys(envRefs).length
-      ? await request({ op: "draw_env", env: envRefs, token: adminToken() })
+      ? await request({ op: "draw_env", env: envRefs, token: clientToken(), ...context })
       : { env: {} };
     checkInterrupted();
 
     const childEnvExtra: Record<string, string> = {};
     if (gitCredRef) {
-      const { token } = await request({ op: "auth_issue_oneshot", ref: gitCredRef, channel: 'git/askpass', token: adminToken() });
+      // The grant keeps the caller's identity and declared purpose/target; the
+      // child receives only the bound token, never the scoped client bearer.
+      const { token } = await request({ op: "auth_issue_oneshot", ref: gitCredRef, channel: 'git/askpass', token: clientToken(), ...context });
       checkInterrupted();
       const dir = mkdtempSync(join(tmpdir(), "ws-askpass-"));
       tempDirs.push(dir);
@@ -199,6 +246,8 @@ async function exec(rest: string[]): Promise<number> {
       const embedded = import.meta.path.startsWith("/$bunfs/") || import.meta.path.includes("/~BUN/");
       const launcher = [process.execPath, ...(embedded ? [] : [process.argv[1]]), "askpass"];
       writeFileSync(script, `#!/bin/sh\nexec ${launcher.map(shellQuote).join(" ")} "$@"\n`, { mode: 0o700 });
+      // Only the bound one-shot reaches the helper. The scoped client bearer and the
+      // admin token stay in this process: a build script cannot inherit draw rights.
       Object.assign(childEnvExtra, {
         WELLSPRING_REF: gitCredRef, WELLSPRING_ONESHOT: token,
         GIT_ASKPASS: script, SSH_ASKPASS: script, SSH_ASKPASS_REQUIRE: "force", DISPLAY: ":0",
@@ -208,13 +257,17 @@ async function exec(rest: string[]): Promise<number> {
     const stdio: Array<"inherit" | "pipe"> = ["inherit", "inherit", "inherit"];
     const fdValues: string[] = [];
     for (const { ref } of fdRefs) {
-      const { value } = await request({ op: "draw", ref, channel: "A2/fd", token: adminToken() });
+      const { value } = await request({ op: "draw", ref, channel: "A2/fd", token: clientToken(), ...context });
       checkInterrupted();
       fdValues.push(value);
       stdio.push("pipe");
     }
     const inherited = { ...process.env };
+    // The child inherits secrets through its mapped channels only. Every token that
+    // could widen its reach — admin, scoped client, passphrase material — is stripped;
+    // askpass children keep the single bound one-shot injected below.
     delete inherited.WELLSPRING_ADMIN_TOKEN;
+    delete inherited.WELLSPRING_CLIENT_TOKEN;
     delete inherited.WELLSPRING_KEY;
     delete inherited.WELLSPRING_PASSPHRASE;
     delete inherited.WELLSPRING_PASSPHRASE_FILE;
@@ -292,7 +345,7 @@ async function main() {
     }
     case "--help":
     case "help":
-      console.log("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ...\n  put ... --from <src>  Reference an external source instead of storing a copy\n  adopt      Copy an external source value into the vault\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
+      console.log("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|seal|unseal|keychain> ...\n  put ... --from <src>  Reference an external source instead of storing a copy\n  adopt      Copy an external source value into the vault\n  exec --purpose <reason> [--target <target>] -- <cmd>  Declared intent for every draw in this exec\n  derive <op> <ref> [--purpose <reason>] [--target <target>]\n  client-issue <caller>  Admin: mint a scoped bearer (printed on stdout)\n  request <label> --purpose <reason> --channel <channel> [--target <target>] [--ttl 15m]\n  request-status <requestId> / request-cancel <requestId>\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
       break;
     case "put": {
       const ttlRaw = flag("ttl");
@@ -339,12 +392,15 @@ async function main() {
       break;
     }
     case "list": {
-      const r = await rpc({ op: "list" });
+      // Normal operations authenticate with the scoped client bearer when one is
+      // configured, so a scoped agent sees only what its policy allows.
+      const r = await rpc({ op: "list", token: clientToken() });
       console.log(JSON.stringify(r.descriptors, null, 2));
       break;
     }
     case "describe": {
-      const r = await rpc({ op: "describe", id: rest[0] });
+      // Same auth switch as list: scoped bearer first, admin only when no client token exists.
+      const r = await rpc({ op: "describe", id: rest[0], token: clientToken() });
       console.log(JSON.stringify(r, null, 2));
       break;
     }
@@ -381,12 +437,27 @@ async function main() {
     }
     case "derive": {
       // Human-facing counterpart of the MCP derive tool: the key stays in the daemon.
-      const [op, refOrId, field] = rest;
-      if (!op || !refOrId) throw new Error("usage: derive <totp|hmac|encrypt|decrypt> <ref|id> [field]");
+      // Flags are stripped first: they must never be mistaken for the [field] positional.
+      const words = rest.filter((word, i) => !word.startsWith("--") && !(i > 0 && rest[i - 1].startsWith("--")));
+      const [op, refOrId, field] = words;
+      if (!op || !refOrId || words.length > 3) throw new Error("usage: derive <totp|hmac|encrypt|decrypt> <ref|id> [field] [--purpose <reason>] [--target <target>]");
       if (!["totp", "hmac", "encrypt", "decrypt"].includes(op)) throw new Error(`unknown derive op: ${op}`);
       // A bare id defaults to the "value" field, matching every other CLI subcommand.
       const ref = refOrId.includes("/") ? refOrId : `${refOrId}/${field ?? "value"}`;
-      const msg: Record<string, unknown> = { op: `derive_${op}`, ref, token: adminToken() };
+      // derive is a normal secret operation, not management: scoped token first.
+      const msg: Record<string, unknown> = { op: `derive_${op}`, ref, token: clientToken() };
+      // Declared intent travels with the derivation; the daemon matches it against
+      // the grant. It is a claim about the caller's purpose, not a verified origin.
+      const purpose = flag("purpose");
+      const target = flag("target");
+      if (purpose !== undefined) {
+        if (!purpose || purpose.startsWith("--")) throw new Error("--purpose requires a value");
+        msg.purpose = purpose;
+      }
+      if (target !== undefined) {
+        if (!target || target.startsWith("--")) throw new Error("--target requires a value");
+        msg.target = target;
+      }
       if (op === "hmac") {
         msg.data = (await new Promise<string>((resolve, reject) => {
           // HMAC needs the exact bytes to sign; a shell-mangled newline changes the MAC.
@@ -415,6 +486,61 @@ async function main() {
       console.log(op === "encrypt" || op === "decrypt" ? String(r.blob ?? r.plaintext) : JSON.stringify(r));
       break;
     }
+    // Admin-only: mint a scoped bearer for an agent identity. Management and every
+    // normal operation authenticate with DIFFERENT tokens, so a leaked client token
+    // can never author a new client or touch policy.
+    case "client-issue": {
+      const [caller, ...extra] = rest;
+      if (!caller || caller.startsWith("-") || extra.length) throw new Error("usage: client-issue <caller>");
+      const token = adminToken();
+      if (!token) throw new Error("client-issue requires admin authentication");
+      const r = await rpc({ op: "client_issue", caller, token });
+      // The token has to reach the human: it is printed on stdout and nowhere else.
+      console.log(String(r.token));
+      break;
+    }
+    // Ask a human to fill a credential through the Web UI. The CLI never fulfills a
+    // request: only the human browser can, so no agent path can self-answer.
+    case "request": {
+      const positional = rest.filter((word, i) => !word.startsWith("--") && !(i > 0 && rest[i - 1].startsWith("--")));
+      const [label] = positional;
+      const purpose = flag("purpose");
+      const channel = flag("channel");
+      const target = flag("target");
+      const ttlRaw = flag("ttl");
+      const known = ["--purpose", "--channel", "--target", "--ttl"];
+      for (const word of rest) {
+        if (word.startsWith("--") && !known.includes(word)) throw new Error(`unknown request flag: ${word}`);
+      }
+      if (!label || positional.length > 1) throw new Error("usage: request <label> --purpose <reason> --channel <channel> [--target target] [--ttl duration]");
+      if (!purpose || purpose.startsWith("--")) throw new Error("request requires --purpose <reason>");
+      if (!channel || channel.startsWith("--")) throw new Error("request requires --channel <channel>");
+      if (target !== undefined && (!target || target.startsWith("--"))) throw new Error("--target requires a value");
+      if (ttlRaw !== undefined && (!ttlRaw || ttlRaw.startsWith("--"))) throw new Error("--ttl requires a duration (e.g. 5m, 1h)");
+      if (!(DELIVERY_CHANNELS as readonly string[]).includes(channel)) {
+        throw new Error(`invalid --channel: ${channel} (one of ${DELIVERY_CHANNELS.join(", ")})`);
+      }
+      const msg: Record<string, unknown> = { op: "request_create", label, purpose, channel, token: clientToken() };
+      if (target !== undefined) msg.target = target;
+      if (ttlRaw !== undefined) msg.ttlMs = parseTtlMs(ttlRaw);
+      const r = await rpc(msg);
+      console.log(JSON.stringify(r, null, 2));
+      break;
+    }
+    case "request-status": {
+      const [requestId, ...extra] = rest;
+      if (!requestId || requestId.startsWith("-") || extra.length) throw new Error("usage: request-status <requestId>");
+      const r = await rpc({ op: "request_status", requestId, token: clientToken() });
+      console.log(JSON.stringify(r, null, 2));
+      break;
+    }
+    case "request-cancel": {
+      const [requestId, ...extra] = rest;
+      if (!requestId || requestId.startsWith("-") || extra.length) throw new Error("usage: request-cancel <requestId>");
+      const r = await rpc({ op: "request_cancel", requestId, token: clientToken() });
+      console.log(JSON.stringify(r, null, 2));
+      break;
+    }
     case "askpass": {
       // Called by git/ssh via GIT_ASKPASS/SSH_ASKPASS script. Env: WELLSPRING_REF, WELLSPRING_ONESHOT.
       const ref = process.env.WELLSPRING_REF;
@@ -426,7 +552,7 @@ async function main() {
       process.exit(0);
     }
     default:
-      console.error("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|seal|unseal|keychain> ... (see --help)");
+      console.error("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|seal|unseal|keychain> ... (see --help)");
       process.exit(2);
   }
 }

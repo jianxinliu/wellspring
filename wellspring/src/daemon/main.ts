@@ -8,9 +8,11 @@
 import { createServer, connect, Socket } from "node:net";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync, rmSync, renameSync, chmodSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { listDescriptors, describe, getSecret, getSecretFresh, putSecret, putSource, adoptSource, deleteSecret, mask, fingerprint, isExpiryError, getMasterKey } from "../core/store.ts";
+import { listDescriptors, describe, getSecretFresh, putSecret, putSource, adoptSource, deleteSecret, isExpiryError, getMasterKey, getField, setUsePolicy } from "../core/store.ts";
+import { validateChannel, boundedText, useAllowed, discoverAllowed } from "../policy/access.ts";
+import { cleanupRequests, createRequest, requestStatus, listRequests, fulfillRequest, cancelRequest } from "../core/requests.ts";
 import { totp, hmac, encryptAesGcm, decryptAesGcm } from "../core/derive.ts";
 
 export const WS_HOME = process.env.WELLSPRING_HOME ?? join(homedir(), ".wellspring");
@@ -79,31 +81,65 @@ function ensureAdminToken(): string {
 const ADMIN_TOKEN = ensureAdminToken();
 
 // One-shot tokens: issued for exec, burned after a single use, expire in 60s.
-type Grant = { expires: number; ref: string; channel: string };
+type Principal = { role: "admin" | "client" | "oneshot"; caller: string; purpose?: string; target?: string };
+type Grant = Principal & { expires: number; ref: string; channel: string };
 const oneShot = new Map<string, Grant>();
-function issueOneShot(ref: unknown, channel: unknown): string {
-  if (typeof ref !== 'string' || !/^(?:secret:\/\/)?[^/\s]+(?:\/[^/\s]+)?$/.test(ref)) throw new Error('one-shot requires a single secret ref');
-  if (typeof channel !== 'string' || !['git/askpass','ssh/askpass','A2/fd'].includes(channel)) throw new Error('invalid one-shot channel');
+const PRINCIPAL = Symbol("authenticatedPrincipal");
+const CLIENT_PATH = join(WS_HOME, "client-tokens.json");
+function loadClients(): Record<string, string> {
+  return existsSync(CLIENT_PATH) ? JSON.parse(readFileSync(CLIENT_PATH, "utf8")) : {};
+}
+function issueClient(caller: unknown) {
+  const identity = boundedText(caller, "caller");
+  if (identity === "admin") throw new Error("reserved caller");
+  const clients = loadClients();
+  if (Object.keys(clients).length >= 10000) throw new Error("too many clients");
+  const token = "cl_" + randomBytes(32).toString("base64url"); clients[token] = identity;
+  mkdirSync(WS_HOME, { recursive: true });
+  writeFileSync(CLIENT_PATH + ".tmp", JSON.stringify(clients), { mode: 0o600 }); chmodSync(CLIENT_PATH + ".tmp", 0o600);
+  renameSync(CLIENT_PATH + ".tmp", CLIENT_PATH); chmodSync(CLIENT_PATH, 0o600);
+  return { token };
+}
+function issueOneShot(msg: any): string {
+  const { ref, channel } = msg;
+  if (typeof ref !== "string" || !/^(?:secret:\/\/)?[^/\s]+(?:\/[^/\s]+)?$/.test(ref)) throw new Error("one-shot requires a single secret ref");
+  if (!["git/askpass", "ssh/askpass", "A2/fd"].includes(channel)) throw new Error("invalid one-shot channel");
   const [id, field] = parseRef(ref);
-  getSecret(id, field); // Validate existence before granting.
+  checkAccess(msg, id, field, channel); // Metadata only: do not decrypt/contact a source while minting a grant.
+  const f = getField(id, field); if (f.expiresAt !== undefined && Date.now() >= f.expiresAt) throw new Error(`secret expired: ${id}/${field}`);
   const now = Date.now();
   for (const [token, grant] of oneShot) if (grant.expires <= now) oneShot.delete(token);
-  if (oneShot.size >= 10000) throw new Error('too many active grants');
-  const tok = 'os_' + randomBytes(24).toString('base64url');
-  oneShot.set(tok, {expires: now + 60_000, ref: `${id}/${field}`, channel});
+  if (oneShot.size >= 10000) throw new Error("too many active grants");
+  const tok = "os_" + randomBytes(24).toString("base64url");
+  oneShot.set(tok, { ...msg[PRINCIPAL], purpose: msg.purpose, target: msg.target, role: "oneshot", expires: now + 60_000, ref: `${id}/${field}`, channel });
   return tok;
 }
-function burnToken(msg: any): "admin" | "oneshot" | null {
+function burnToken(msg: any): Principal["role"] | null {
+  if (Object.prototype.hasOwnProperty.call(msg, PRINCIPAL)) return msg[PRINCIPAL]?.role ?? null;
   const t = String(msg.token ?? "");
-  const eq = (a: string, b: string) => { const aa=Buffer.from(a), bb=Buffer.from(b); return aa.length === bb.length && timingSafeEqual(aa,bb); };
-  if (eq(t, ADMIN_TOKEN)) return "admin";
-  const grant = oneShot.get(t);
-  if (grant) {
-    oneShot.delete(t); // Every attempted use consumes the capability, including scope violations.
-    const [id, field] = parseRef(msg.ref ?? '');
-    if (grant.expires > Date.now() && msg.op === 'draw' && `${id}/${field}` === grant.ref && msg.channel === grant.channel) return 'oneshot';
+  const aa = Buffer.from(t), bb = Buffer.from(ADMIN_TOKEN);
+  let principal: Principal | null = null;
+  if (aa.length === bb.length && timingSafeEqual(aa, bb)) principal = { role: "admin", caller: "admin" };
+  else {
+    const clients = loadClients();
+    if (Object.prototype.hasOwnProperty.call(clients, t)) principal = { role: "client", caller: clients[t]! };
+    const grant = oneShot.get(t);
+    if (grant) {
+      oneShot.delete(t);
+      const [id, field] = parseRef(msg.ref ?? "");
+      if (grant.expires > Date.now() && msg.op === "draw" && `${id}/${field}` === grant.ref && msg.channel === grant.channel) principal = grant;
+    }
   }
-  return null;
+  Object.defineProperty(msg, PRINCIPAL, { value: principal });
+  return principal?.role ?? null;
+}
+function checkAccess(msg: any, id: string, field: string, channel: string): void {
+  const principal: Principal | null = msg[PRINCIPAL];
+  const context = { caller: principal?.caller ?? "", channel, purpose: principal?.role === "oneshot" ? principal.purpose : msg.purpose, target: principal?.role === "oneshot" ? principal.target : msg.target };
+  if (!principal || !useAllowed(getField(id, field).usePolicy, context)) {
+    logDraw({ ts: Date.now(), op: String(msg.op), entry: id, field, channel, verdict: "denied_access" });
+    throw new Error("access denied");
+  }
 }
 
 // simple in-memory rate limit for resolve
@@ -123,7 +159,7 @@ type DrawEvent = {
   field: string;
   channel: string;
   reason?: string;
-  verdict: "ok" | "denied_rate" | "denied_reason" | "denied_auth" | "expired" | "error";
+  verdict: "ok" | "denied_rate" | "denied_reason" | "denied_auth" | "denied_access" | "expired" | "error";
 };
 
 function logDraw(e: DrawEvent) {
@@ -162,7 +198,7 @@ function parseRef(ref: string): [string, string] {
  */
 function deriveOp(msg: any): any {
   const base = { ts: Date.now(), op: String(msg.op), entry: String(msg.ref ?? ""), field: "*", channel: String(msg.op) };
-  if (burnToken(msg) !== "admin") {
+  if (!["admin", "client"].includes(burnToken(msg) ?? "")) {
     logDraw({ ...base, verdict: "denied_auth" });
     return { error: "unauthorized" };
   }
@@ -175,6 +211,7 @@ function deriveOp(msg: any): any {
     return { error: "rate limited" };
   }
   try {
+    checkAccess(msg, id, field, msg.op);
     const material = getSecretFresh(id, field);
     let result: any;
     if (msg.op === "derive_totp") {
@@ -203,21 +240,65 @@ function deriveOp(msg: any): any {
   }
 }
 
-export function handle(msg: any): any {
+export function handle(input: any): any {
+  try {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid message");
+    const msg = { ...input };
+    cleanupRequests();
+    burnToken(msg);
+    return dispatch(msg);
+  } catch (error) { return { error: String(error?.message ?? error) }; }
+}
+function dispatch(msg: any): any {
+  const principal: Principal | null = msg[PRINCIPAL];
+  // Scoped bearers carry only discovery, request owner operations, draw and derive capabilities.
+  if (principal?.role === "client" && !["ping", "list", "describe", "request_create", "request_status", "request_cancel", "policy_get", "auth_issue_oneshot", "draw", "draw_env", "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt"].includes(msg.op)) return { error: "unauthorized" };
+  const visible = (f: any) => principal?.role === "admin" || discoverAllowed(f.usePolicy, principal?.caller);
   switch (msg.op) {
+    case "client_issue":
+      return principal?.role === "admin" ? issueClient(msg.caller) : { error: "unauthorized" };
+    case "access_put":
+      if (principal?.role !== "admin") return { error: "unauthorized" };
+      setUsePolicy(msg.id, msg.field, msg.usePolicy);
+      logDraw({ ts: Date.now(), op: msg.op, entry: msg.id, field: msg.field, channel: "admin", verdict: "ok" });
+      return { ok: true };
+    case "request_create": {
+      if (!principal || principal.role === "oneshot") return { error: "unauthorized" };
+      const { op, token, caller, ...args } = msg;
+      const r = createRequest(principal.caller, args);
+      logDraw({ ts: Date.now(), op: msg.op, entry: r.requestId, field: "*", channel: msg.channel, verdict: "ok" });
+      return r;
+    }
+    case "request_status":
+      return principal && principal.role !== "oneshot" ? requestStatus(msg.requestId, principal.caller, principal.role === "admin") : { error: "unauthorized" };
+    case "request_list":
+      return principal?.role === "admin" ? { requests: listRequests() } : { error: "unauthorized" };
+    case "request_fulfill": {
+      if (principal?.role !== "admin") return { error: "unauthorized" };
+      const r = fulfillRequest(msg.requestId, msg);
+      logDraw({ ts: Date.now(), op: msg.op, entry: r.requestId, field: "*", channel: "admin", verdict: "ok" });
+      return r;
+    }
+    case "request_cancel": {
+      if (!principal || principal.role === "oneshot") return { error: "unauthorized" };
+      const r = cancelRequest(msg.requestId, principal.caller, principal.role === "admin");
+      // Record who cancelled: an owner cancelling its own request is not an admin action.
+      logDraw({ ts: Date.now(), op: msg.op, entry: r.requestId, field: "*", channel: principal.role === "admin" ? "admin" : "request/owner", verdict: "ok" });
+      return r;
+    }
     case "ping":
       return { pong: true, version: "0.1.0" };
     case "auth_check":
       return burnToken(msg) === "admin" ? { ok: true } : { error: "unauthorized" };
     case "auth_issue_oneshot": {
-      // admin-only: used by CLI/MCP before spawning a child that needs draw access
-      if (burnToken(msg) !== "admin") return { error: "unauthorized" };
-      return { token: issueOneShot(msg.ref, msg.channel) };
+      // Scoped callers may delegate only an already-allowed field and context.
+      if (!["admin", "client"].includes(burnToken(msg) ?? "")) return { error: "unauthorized" };
+      return { token: issueOneShot(msg) };
     }
     case "list":
-      return { descriptors: listDescriptors({ tag: msg.tag }) };
+      return { descriptors: listDescriptors({ tag: msg.tag }, visible) };
     case "describe":
-      return describe(msg.id);
+      return describe(msg.id, visible);
     case "policy_get":
       return { policy: loadPolicy() };
     case "policy_put": {
@@ -230,7 +311,7 @@ export function handle(msg: any): any {
     case "put": {
       if (burnToken(msg) !== "admin") return { error: "unauthorized" };
       // Rotation replaces the value without reading it, including when it has expired.
-      putSecret(msg.id, msg.field, msg.value, { cls: msg.cls, mask: msg.mask, tags: msg.tags, ttlMs: msg.ttlMs, expiresAt: msg.expiresAt });
+      putSecret(msg.id, msg.field, msg.value, { cls: msg.cls, mask: msg.mask, tags: msg.tags, ttlMs: msg.ttlMs, expiresAt: msg.expiresAt, usePolicy: msg.usePolicy });
       logDraw({ ts: Date.now(), op: "put", entry: msg.id, field: msg.field, channel: "admin", verdict: "ok" });
       return { ok: true };
     }
@@ -239,7 +320,7 @@ export function handle(msg: any): any {
     // and it is recorded as such: the audit trail must show who pointed a ref at what.
     case "put_source": {
       if (burnToken(msg) !== "admin") return { error: "unauthorized" };
-      putSource(msg.id, msg.field, msg.source ?? msg.from, { cls: msg.cls, mask: msg.mask, tags: msg.tags, ttlMs: msg.ttlMs, expiresAt: msg.expiresAt });
+      putSource(msg.id, msg.field, msg.source ?? msg.from, { cls: msg.cls, mask: msg.mask, tags: msg.tags, ttlMs: msg.ttlMs, expiresAt: msg.expiresAt, usePolicy: msg.usePolicy });
       logDraw({ ts: Date.now(), op: "put_source", entry: String(msg.id), field: String(msg.field), channel: "admin", verdict: "ok" });
       return { ok: true };
     }
@@ -269,7 +350,7 @@ export function handle(msg: any): any {
       return { ok: true };
     }
     case "view": {
-      const d = describe(msg.id);
+      const d = describe(msg.id, visible);
       return { maskedPreview: d.maskedPreview };
     }
     case "resolve": {
@@ -287,6 +368,7 @@ export function handle(msg: any): any {
         return { error: "rate limited" };
       }
       // Expiry is checked last so an unauthenticated caller learns nothing new.
+      checkAccess(msg, msg.id, msg.field, "resolve");
       const drawn = drawFresh({ op: "resolve", entry: msg.id, field: msg.field, channel: "resolve", reason: msg.reason });
       if ("error" in drawn) return drawn;
       logDraw({ ts: Date.now(), op: "resolve", entry: msg.id, field: msg.field, channel: "resolve", reason: msg.reason, verdict: "ok" });
@@ -300,6 +382,15 @@ export function handle(msg: any): any {
         return { error: "unauthorized" };
       }
       // Fail closed: draw every ref first, so an expiry never ships a partial env.
+      for (const ref of Object.values(msg.env ?? {})) {
+        const [id, field] = parseRef(ref as string);
+        checkAccess(msg, id, field, "A1/exec");
+        const f = getField(id, field);
+        if (f.expiresAt !== undefined && Date.now() >= f.expiresAt) {
+          logDraw({ ts: Date.now(), op: "draw_env", entry: id, field, channel: "A1/exec", verdict: "expired" });
+          return { error: `secret expired: ${id}/${field}` };
+        }
+      }
       const env: Record<string, string> = {};
       const failures: string[] = [];
       for (const [varName, ref] of Object.entries(msg.env ?? {})) {
@@ -320,6 +411,9 @@ export function handle(msg: any): any {
         return { error: "unauthorized" };
       }
       const [id, field] = parseRef(msg.ref);
+      const channel = validateChannel(msg.channel ?? "A2/fd");
+      if (channel === "resolve" || channel.startsWith("derive_")) throw new Error("invalid draw channel");
+      checkAccess(msg, id, field, channel);
       const drawn = drawFresh({ op: "draw", entry: id, field, channel: msg.channel ?? "A2/fd" });
       if ("error" in drawn) return drawn;
       logDraw({ ts: Date.now(), op: "draw", entry: id, field, channel: msg.channel ?? "A2/fd", verdict: "ok" });

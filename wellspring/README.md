@@ -29,9 +29,20 @@ wellspring exec --secret DB_PASSWORD=cred:db_prod/password -- node app.js   # A1
 wellspring exec --secret-fd CERT=cred:db_prod/password -- node app.js       # A2 fd 管道
 wellspring exec --git-cred cred:github_pat/value -- git push                # GIT_ASKPASS + 一次性 token
 
+# 声明意图：同一 purpose/target 会随本次 exec 的每一次 draw/draw_env/一次性令牌下发
+wellspring exec --purpose deploy --target api.example.com \
+  --secret DB_PASSWORD=cred:db_prod/password -- node app.js
+
 # 5. 短期凭证：到期自动失效
 wellspring put cred:temp_key value 'abc' --ttl 1h                           # 也支持 30m / 7d / 900（秒）
 wellspring exec --secret TOKEN=cred:temp_key/value -- node app.js           # 过期后拒绝分发
+
+# 6. 独立 Agent 身份：签发 scoped token，由宿主注入 WELLSPRING_CLIENT_TOKEN
+wellspring client-issue release-agent       # 仅打印 token，不写入任何日志
+# 7. 需要人工补录凭据：创建请求 → 用户在 Web 填写 → 查询状态
+wellspring request github-release --purpose publish --channel A1/exec --target github.com --ttl 15m
+wellspring request-status req_xxx
+wellspring request-cancel req_xxx
 ```
 
 守护进程被 kill 后残留的 socket 文件会在下次启动时自动回收；若该路径上已有存活守护进程，则拒绝启动并提示改用其他 `WELLSPRING_SOCK`。Web UI 端口默认 7777（`WELLSPRING_HTTP_PORT` 可改），端口被占用时自动改用随机端口而不是让守护进程退出。
@@ -44,7 +55,7 @@ wellspring exec --secret TOKEN=cred:temp_key/value -- node app.js           # �
 | src/daemon/main.ts | wellspringd：unix socket JSON-RPC、token 鉴权、限速、审计 JSONL |
 | src/daemon/web.ts | Web 管理台：凭据库 / 审计流水 / 用量统计（127.0.0.1） |
 | src/cli/main.ts | CLI：put/list/describe/view/resolve/policy/audit/exec/askpass |
-| src/mcp/server.ts | MCP stdio server：4 工具，默认抑制执行输出，可选择精确值脱敏 |
+| src/mcp/server.ts | MCP stdio server：6 工具，默认抑制执行输出，可选择精确值脱敏 |
 | test/e2e.test.ts | 端到端回归测试（bun test） |
 
 ## 安全模型
@@ -66,6 +77,30 @@ wellspring exec --secret TOKEN=cred:temp_key/value -- node app.js           # �
 先运行守护进程，再启动客户端。默认读取 `~/.wellspring/admin.token`，无需把令牌放进 MCP 配置。自定义存储位置时，在守护进程和 MCP 的环境中设置相同的 `WELLSPRING_HOME`；也可显式设置 `WELLSPRING_SOCK`。
 
 `wellspring_exec` 需要 `command` 参数数组，可搭配 `env`、`fd`、`files` 引用映射。`env` 注入变量值；`fd` 通过 `WELLSPRING_FD_<名称>` 告知子进程只读凭据管道的描述符；`files` 注入 0600 临时文件路径并在执行后清理。还可用 `templates` 把模板文本渲染为临时配置文件。所有交付映射中的名称不可重复。
+
+## 任务中补充凭据
+
+Agent 调用 `wellspring_request`，只填写需要什么、用途、交付通道、预期目标和等待期限。用户打开 Web 管理台的「待填写」，核对请求后在独立表单输入值，默认「仅本次任务」，也可选择保存。值直接交给守护进程，不经过聊天；Agent 调用 `wellspring_request_status` 获取状态，只有完成后才返回 `secret://…` 引用。
+
+临时凭据随请求期限到期，后台在后续请求或读取前清理；这不是用一次即焚。等待期间 Agent 应暂停并让用户填写，不要持续轮询。请求状态持久化，守护进程重启后仍可继续。取消、过期或已经完成的请求不能再次填写；保存时目标条目已存在会报错，避免覆盖旧凭据。
+
+MCP 示例（没有秘密值）：
+
+```json
+{"name":"wellspring_request","arguments":{"label":"GitHub 发布凭据","purpose":"publish_release","target":"github.com","channel":"A1/exec","ttlMs":900000}}
+```
+
+完成后用返回的 ref 执行 `wellspring_exec`，同时传入相同的 `purpose` 和 `target`。`wellspring_request_status` 的 `cancel:true` 可取消等待中的请求。当前不会自动唤醒 MCP 宿主里的任务；用户填写后让 Agent 继续检查状态。
+
+ref 只在查询时才知道，所以 **Agent 必须自己保留 requestId**：`request_status` 按 id 查询，请求记录保留 7 天后清理，此后用该 id 查询会得到 `no such request`。跨任务复用的凭据应在提交时选择「保存供以后使用」并给出名称，之后从 `wellspring_list` 里找条目；「仅本次任务」的值随请求期限到期删除，过期后取不回来，只能重新发起请求。
+
+### 每项凭据的使用范围
+
+Web 凭据字段的「使用范围」可限制调用者、通道、用途、目标。各列表按精确字符串匹配，不同维度同时满足才放行，空的维度不限制。校验在守护进程中执行，先检查范围再解密或读取外部来源；批量环境变量先检查所有字段。轮换或切换来源保留既有范围。
+
+调用者由宿主提供的令牌确定，不相信 Agent 参数里的身份。人类管理员身份是 `admin`，也受字段范围检查。宿主可用 `wellspring client-issue release-agent` 签发独立令牌，然后通过受保护的宿主环境 `WELLSPRING_CLIENT_TOKEN` 注入 CLI/MCP；不要把令牌放入对话。没有配置时保持读取 admin token 的兼容行为，因此按 Agent 隔离需要宿主明确配置独立令牌。相同调用者名称表示同一权限主体。
+
+**用途和目标是调用方声明的意图，只做精确策略匹配，不核验网络流量或实际进程目的地。** 有权修改接收程序、读取同 UID 文件或操作宿主配置的 Agent 仍可能接触秘密；要获得更强隔离，应配合可信执行器和独立 OS 权限边界。
 
 ## 外部来源（值不存进来）
 
@@ -126,9 +161,12 @@ wellspring derive totp cred:mfa/value              # 输出 6 位验证码与剩
 printf 'GET /v1/orders' | wellspring derive hmac cred:sign_key/key --alg sha256
 printf '{"amount":1}'   | wellspring derive encrypt cred:enc_key/key   # 输出 base64 密文
 wellspring derive decrypt cred:enc_key/key --blob '<base64>'           # 输出明文
+
+# 受字段「使用范围」约束的密钥，要同时声明相同的用途与目标
+wellspring derive totp cred:mfa/value --purpose deploy --target api.example.com
 ```
 
-四个 op 与 `put`/`draw` 同级：需要 admin token、计入限速、写入审计（op 名为 `derive_<kind>`），并在解密前检查有效期。返回的是**运算结果**，原始密钥不会出守护进程。验证码、MAC 和解密明文仍可能是敏感信息；调用这些操作即允许相应结果进入 Agent 上下文，尤其应谨慎开放 `decrypt`。
+四个 op 与 `put`/`draw` 同级：需要 admin 或 scoped client token、计入限速、写入审计（op 名为 `derive_<kind>`），并在解密前检查有效期。返回的是**运算结果**，原始密钥不会出守护进程。验证码、MAC 和解密明文仍可能是敏感信息；调用这些操作即允许相应结果进入 Agent 上下文，尤其应谨慎开放 `decrypt`。
 
 上表同时列出每个 op 对字段**内容格式**的要求：TOTP 要 base32 种子，加密要 32 字节 base64 密钥。格式不符时守护进程直接报错，而不是给出错误结果。
 
