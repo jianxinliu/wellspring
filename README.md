@@ -45,9 +45,12 @@
 | 存储：AES-256-GCM，描述符（指纹 + 脱敏）永不反解 | ✅ |
 | 交付通道 A1 env / A2 fd / C1 文件 / C1 模板 / askpass | ✅ |
 | **派生运算 derive**：TOTP / HMAC 签名 / AES-256-GCM 加解密，只回结果不回密钥 | ✅ |
-| MCP server（list / describe / exec / derive / request / request_status 共 6 个工具），69 项端到端测试 | ✅ |
-| Web 管理台：凭据库 / 审计流水 / 用量统计 / 访问策略 / 待填写请求 | ✅ |
+| MCP server（list / describe / exec / derive / request / request_status 共 6 个工具），80 项端到端测试 | ✅ |
+| Web 管理台：凭据库 / 使用记录 / 概览 / 设置 / 待填写请求 | ✅ |
 | 任务中补充凭据：Agent 只发请求，人在独立页面录入，回传引用继续执行 | ✅ |
+| 填写等待（`waitMs` ≤55s，填写即返回，超时返回待处理，期间其他工具可用） | ✅ |
+| 外部来源引用（`env:` / `file:` / `dotenv:` / `cmd:`，库里只存定义不存值） | ✅ |
+| 加密备份（`export`/`import`，独立口令，整档校验后原子替换） | ✅ |
 | 每字段使用范围（调用者 / 通道 / 用途 / 目标，取水前校验） | ✅ |
 | 独立调用身份（scoped token），调用者由宿主令牌决定而非 agent 参数 | ✅ |
 | 短期凭证（TTL，到期即拒绝出水） | ✅ |

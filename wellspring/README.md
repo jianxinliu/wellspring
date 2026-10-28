@@ -51,10 +51,11 @@ wellspring request-cancel req_xxx
 
 | 路径 | 说明 |
 |---|---|
-| src/core/store.ts | AES-256-GCM 存储（@noble/ciphers），指纹 + 脱敏 |
+| src/core/store.ts | AES-256-GCM 存储（@noble/ciphers），指纹 + 脱敏，支持外部来源引用 |
+| src/core/backup.ts | 加密备份归档：导出/导入、整档校验、原子替换 |
 | src/daemon/main.ts | wellspringd：unix socket JSON-RPC、token 鉴权、限速、审计 JSONL |
-| src/daemon/web.ts | Web 管理台：凭据库 / 审计流水 / 用量统计（127.0.0.1） |
-| src/cli/main.ts | CLI：put/list/describe/view/resolve/policy/audit/exec/askpass |
+| src/daemon/web.ts | Web 管理台：凭据库 / 待填写 / 使用记录 / 概览 / 设置（127.0.0.1） |
+| src/cli/main.ts | CLI：put/list/describe/view/resolve/policy/audit/exec/derive/request/export/import/seal |
 | src/mcp/server.ts | MCP stdio server：6 工具，默认抑制执行输出，可选择精确值脱敏 |
 | test/e2e.test.ts | 端到端回归测试（bun test） |
 

@@ -350,6 +350,7 @@ function drawRequests() {
     '<p class="hint">用途和目标由调用方声明，并不代表已验证实际使用目的或网络目的地。</p>' +
     (status === 'pending' ? '<form id="request-form"><label for="request-value">请填写 ' + esc(r.label || '凭据值') + '</label>' +
       '<input id="request-value" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" style="display:block;width:100%" required>' +
+      '<p class="hint">提交后，正在等这个请求的 agent 会立刻拿到引用，不用再问一遍。</p>' +
       '<label class="request-choice"><input id="request-visible" type="checkbox"> 显示输入内容（支持多行）</label>' +
       '<label class="request-choice"><input type="radio" name="request-save" value="once" checked> 仅本次任务</label>' +
       '<label class="request-choice"><input type="radio" name="request-save" value="save"> 保存供以后使用</label>' +
@@ -507,12 +508,13 @@ function showUsage(button) {
     ['MCP · 验证码（字段填 base32 种子）', JSON.stringify({name:'wellspring_derive',arguments:{op:'totp',ref}}, null, 2)],
     ['MCP · 签名（字段填 HMAC 密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'hmac',ref,data:'<待签名内容>',alg:'sha256'}}, null, 2)],
     ['MCP · 加密（字段填 base64 的 32 字节密钥）', JSON.stringify({name:'wellspring_derive',arguments:{op:'encrypt',ref,plaintext:'<明文>'}}, null, 2)],
+    ['MCP · 等用户填写（最多 55 秒）', JSON.stringify({name:'wellspring_request_status',arguments:{requestId:'req_xxx',waitMs:55000}}, null, 2)],
   ];
   const row = document.createElement('tr'); row.id = 'usage-panel';
   const cell = document.createElement('td'); cell.colSpan = 8; cell.className = 'usage-panel';
   const heading = document.createElement('h3'); heading.textContent = '怎么用 ' + entry.id + '/' + field.name; cell.appendChild(heading);
   const note = document.createElement('p');
-  note.textContent = '上面都只是引用地址，不会读出明文。把 <program> 换成你自己的程序，注意别让它把密钥打印出来。文件描述符用 WELLSPRING_FD_APP_SECRET 取号；APP_SECRET_FILE 指向一个退出时自动删除的临时文件。MCP 示例默认不返回程序输出。';
+  note.textContent = '上面都只是引用地址，不会读出明文。把 <program> 换成你自己的程序，注意别让它把密钥打印出来。文件描述符用 WELLSPRING_FD_APP_SECRET 取号；APP_SECRET_FILE 指向一个退出时自动删除的临时文件。MCP 示例默认不返回程序输出。等填写用 waitMs，最长 55 秒，超时会返回待处理。备份导出导入在命令行做：wellspring export / import，需要先停掉守护进程。';
   cell.appendChild(note);
   for (const [label, text] of examples) {
     const title = document.createElement('h4'); title.textContent = label;
