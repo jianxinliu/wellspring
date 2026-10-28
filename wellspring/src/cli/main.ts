@@ -13,6 +13,7 @@ import { parseExecGuard, checkExecAllowed } from "../policy/exec.ts";
 import { sealMasterKey, unsealMasterKey } from "../core/store.ts";
 import { obtainPassphrase, readKeychainPassphrase, storeKeychainPassphrase, removeKeychainPassphrase } from "../core/custody.ts";
 import { DELIVERY_CHANNELS } from "../policy/access.ts";
+import { exportBackup, importBackup, obtainBackupPassphrase } from "../core/backup.ts";
 
 const WS_HOME = process.env.WELLSPRING_HOME ?? join(process.env.HOME ?? "", ".wellspring");
 export const SOCK_PATH = process.env.WELLSPRING_SOCK ?? join(WS_HOME, "wellspringd.sock");
@@ -271,6 +272,8 @@ async function exec(rest: string[]): Promise<number> {
     delete inherited.WELLSPRING_KEY;
     delete inherited.WELLSPRING_PASSPHRASE;
     delete inherited.WELLSPRING_PASSPHRASE_FILE;
+    delete inherited.WELLSPRING_BACKUP_PASSPHRASE;
+    delete inherited.WELLSPRING_BACKUP_PASSPHRASE_FILE;
     delete inherited.WELLSPRING_ONESHOT;
     const childEnv = { ...inherited, ...secretEnv, ...fileEnv, ...childEnvExtra };
     fdRefs.forEach(({ name }, i) => { childEnv[`WELLSPRING_FD_${name}`] = String(3 + i); });
@@ -313,6 +316,18 @@ async function main() {
     return i >= 0 ? rest[i + 1] : undefined;
   };
   switch (cmd) {
+    case "export":
+    case "import": {
+      if (rest.length !== 1 || !rest[0] || rest[0].startsWith("-")) throw new Error(`usage: wellspring ${cmd} <path>`);
+      if (process.env.WELLSPRING_CLIENT_TOKEN || process.env.WELLSPRING_ONESHOT) throw new Error("backup is a human offline management operation; remove scoped client credentials");
+      // Store mutations are synchronous but other processes do not share a lock.
+      // Fail conservatively even for stale socket files: stop the daemon first.
+      if (cmd === "import" && existsSync(SOCK_PATH)) throw new Error("stop wellspringd and remove its socket before offline import");
+      const passphrase = obtainBackupPassphrase(cmd === "export");
+      const result = cmd === "export" ? exportBackup(rest[0], passphrase) : importBackup(rest[0], passphrase);
+      console.log(`${cmd === "export" ? "Exported" : "Imported"} ${result.entries} entries. External source definitions only; host source data is not included.`);
+      break;
+    }
     case "seal":
       if (rest.length) throw new Error("usage: wellspring seal");
       sealMasterKey();
@@ -345,7 +360,7 @@ async function main() {
     }
     case "--help":
     case "help":
-      console.log("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|seal|unseal|keychain> ...\n  put ... --from <src>  Reference an external source instead of storing a copy\n  adopt      Copy an external source value into the vault\n  exec --purpose <reason> [--target <target>] -- <cmd>  Declared intent for every draw in this exec\n  derive <op> <ref> [--purpose <reason>] [--target <target>]\n  client-issue <caller>  Admin: mint a scoped bearer (printed on stdout)\n  request <label> --purpose <reason> --channel <channel> [--target <target>] [--ttl 15m]\n  request-status <requestId> / request-cancel <requestId>\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
+      console.log("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|export|import|seal|unseal|keychain> ...\n  put ... --from <src>  Reference an external source instead of storing a copy\n  adopt      Copy an external source value into the vault\n  exec --purpose <reason> [--target <target>] -- <cmd>  Declared intent for every draw in this exec\n  derive <op> <ref> [--purpose <reason>] [--target <target>]\n  client-issue <caller>  Admin: mint a scoped bearer (printed on stdout)\n  request <label> --purpose <reason> --channel <channel> [--target <target>] [--ttl 15m]\n  request-status <requestId> / request-cancel <requestId>\n  export <path> / import <path>  Human offline encrypted backup; source definitions only\n    Hidden TTY or WELLSPRING_BACKUP_PASSPHRASE[_FILE]; import requires stopped daemon\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
       break;
     case "put": {
       const ttlRaw = flag("ttl");
@@ -552,7 +567,7 @@ async function main() {
       process.exit(0);
     }
     default:
-      console.error("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|seal|unseal|keychain> ... (see --help)");
+      console.error("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|export|import|seal|unseal|keychain> ... (see --help)");
       process.exit(2);
   }
 }

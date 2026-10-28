@@ -26,25 +26,46 @@ function clientToken(): string | undefined {
   return process.env.WELLSPRING_CLIENT_TOKEN || adminToken();
 }
 
-function rpc(msg: object): Promise<any> {
+function rpc(msg: object, signal?: AbortSignal, timeoutMs = 10000): Promise<any> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error('request cancelled'));
     const sock = connect(SOCK_PATH);
     let buf = "";
-    const timer=setTimeout(()=>{sock.destroy();reject(new Error('daemon request timed out'));},10000);
-    sock.once('close',()=>{clearTimeout(timer);reject(new Error('daemon connection closed'));});
+    let settled = false;
+    const finish = (error?: unknown, reply?: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      sock.destroy();
+      error ? reject(error) : resolve(reply);
+    };
+    const abort = () => finish(new Error('request cancelled'));
+    const timer = setTimeout(() => finish(new Error('daemon request timed out')), timeoutMs);
+    signal?.addEventListener('abort', abort, { once: true });
+    sock.once('close', () => finish(new Error('daemon connection closed')));
     sock.on("connect", () => sock.write(JSON.stringify(msg) + "\n"));
     sock.on("data", (c) => {
       buf += c.toString();
       const i = buf.indexOf("\n");
       if (i >= 0) {
         let reply: any;
-        try { reply = JSON.parse(buf.slice(0, i)); } catch (e) { return reject(e); }
-        sock.end();
-        if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return reject(new Error('invalid daemon response'));
-        reply.error ? reject(new Error(reply.error)) : resolve(reply);
+        try { reply = JSON.parse(buf.slice(0, i)); } catch (e) { return finish(e); }
+        if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return finish(new Error('invalid daemon response'));
+        finish(reply.error ? new Error(reply.error) : undefined, reply);
       }
     });
-    sock.on("error", reject);
+    sock.on("error", error => finish(error));
+  });
+}
+
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error('request cancelled'));
+    const finish = () => { signal?.removeEventListener('abort', abort); resolve(); };
+    const timer = setTimeout(finish, ms);
+    const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(new Error('request cancelled')); };
+    signal?.addEventListener('abort', abort, { once: true });
   });
 }
 
@@ -62,10 +83,11 @@ const TOOLS = [
   },
   {
     name: "wellspring_request_status",
-    description: "Check or cancel your credential request. Returns pending, fulfilled, cancelled or expired; fulfilled includes a ref, never its value. While pending, wait for the user instead of repeatedly polling.",
+    description: "Check, wait for, or cancel your credential request. Fulfilled returns a ref, never its value. A bounded wait keeps this call pending; timeout returns pending with waitTimedOut, without resuming finished calls or host turns.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       requestId: { type: "string" },
-      cancel: { type: "boolean", description: "Default false; true cancels the request" },
+      cancel: { type: "boolean", description: "Default false; true cancels the credential request immediately, ignoring waitMs" },
+      waitMs: { type: "integer", minimum: 0, maximum: 55000, description: "Maximum wait in milliseconds, default 0; use a positive bound while the user fills the form" },
     }, required: ["requestId"] },
   },
   {
@@ -129,15 +151,33 @@ const TOOLS = [
   },
 ];
 
-async function callTool(name: string, args: any): Promise<string> {
+async function callTool(name: string, args: any, signal?: AbortSignal): Promise<string> {
   switch (name) {
     case "wellspring_request": {
       if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some(k => !['label','purpose','target','channel','ttlMs'].includes(k))) throw new Error('invalid request arguments; enter values only in the separate Web form');
       return JSON.stringify(await rpc({ ...args, op: 'request_create', token: clientToken() }));
     }
     case "wellspring_request_status": {
-      if (!args || typeof args.requestId !== 'string' || (args.cancel !== undefined && typeof args.cancel !== 'boolean')) throw new Error('invalid request status arguments');
-      return JSON.stringify(await rpc({ op: args.cancel ? 'request_cancel' : 'request_status', requestId: args.requestId, token: clientToken() }));
+      if (!args || Array.isArray(args) || typeof args.requestId !== 'string' || Object.keys(args).some(k => !['requestId','cancel','waitMs'].includes(k)) || (args.cancel !== undefined && typeof args.cancel !== 'boolean')) throw new Error('invalid request status arguments');
+      const waitMs = args.waitMs === undefined ? 0 : args.waitMs;
+      if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 55000) throw new Error('waitMs must be 0..55000');
+      const message = { op: args.cancel ? 'request_cancel' : 'request_status', requestId: args.requestId, token: clientToken() };
+      if (args.cancel || waitMs === 0) return JSON.stringify(await rpc(message, signal));
+      const deadline = performance.now() + waitMs;
+      let status: any;
+      while (true) {
+        const remaining = deadline - performance.now();
+        if (remaining <= 0 && status) return JSON.stringify({ ...status, waitTimedOut: true });
+        try { status = await rpc(message, signal, Math.max(1, Math.min(10000, remaining))); }
+        catch (error) {
+          if (status && !signal?.aborted && error instanceof Error && error.message === 'daemon request timed out' && performance.now() >= deadline) return JSON.stringify({ ...status, waitTimedOut: true });
+          throw error;
+        }
+        if (status.status !== 'pending') return JSON.stringify(status);
+        const delay = Math.min(300, deadline - performance.now());
+        if (delay <= 0) return JSON.stringify({ ...status, waitTimedOut: true });
+        await pause(delay, signal);
+      }
     }
     case "wellspring_list": {
       const r = await rpc({ op: "list", tag: args?.tag, token: clientToken() });
@@ -253,7 +293,7 @@ async function callTool(name: string, args: any): Promise<string> {
 }
 
 // ---- minimal MCP stdio loop ----
-async function handle(msg: any): Promise<any> {
+async function handle(msg: any, signal?: AbortSignal): Promise<any> {
   if (msg.method === "initialize") {
     return {
       protocolVersion: "2024-11-05",
@@ -265,7 +305,7 @@ async function handle(msg: any): Promise<any> {
   if (msg.method === "tools/list") return { tools: TOOLS };
   if (msg.method === "tools/call") {
     try {
-      const text = await callTool(msg.params.name, msg.params.arguments ?? {});
+      const text = await callTool(msg.params.name, msg.params.arguments ?? {}, signal);
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
@@ -276,7 +316,45 @@ async function handle(msg: any): Promise<any> {
 
 let buf = "";
 process.stdin.setEncoding("utf8");
-let pending = Promise.resolve();
+const pending = new Map<string | number, AbortController>();
+const waitingRequests = new Set<string | number>();
+let disconnected = false;
+function disconnect() {
+  disconnected = true;
+  for (const controller of pending.values()) controller.abort();
+}
+function respond(response: object) {
+  if (!disconnected) process.stdout.write(JSON.stringify(response) + '\n');
+}
+async function dispatch(msg: any) {
+  if (msg?.method === 'notifications/cancelled') {
+    pending.get(msg.params?.requestId)?.abort();
+    return;
+  }
+  const hasId = msg?.id !== undefined;
+  const controller = new AbortController();
+  if (hasId) {
+    if (pending.has(msg.id)) {
+      respond({jsonrpc:'2.0',id:msg.id,error:{code:-32600,message:'Request ID already pending'}});
+      return;
+    }
+    pending.set(msg.id, controller);
+    if (msg.method === 'tools/call' && msg.params?.name === 'wellspring_request_status' && !msg.params?.arguments?.cancel && msg.params?.arguments?.waitMs > 0) waitingRequests.add(msg.id);
+  }
+  try {
+    const result = await handle(msg, controller.signal);
+    if (hasId) {
+      const response = controller.signal.aborted
+        ? {jsonrpc:'2.0',id:msg.id,error:{code:-32800,message:'Request cancelled'}}
+        : result === null
+          ? {jsonrpc:'2.0',id:msg.id,error:{code:-32601,message:'Method not found'}}
+          : {jsonrpc:'2.0',id:msg.id,result};
+      respond(response);
+    }
+  } finally {
+    if (hasId) { pending.delete(msg.id); waitingRequests.delete(msg.id); }
+  }
+}
 process.stdin.on("data", (chunk) => {
   buf += chunk;
   let i: number;
@@ -284,20 +362,17 @@ process.stdin.on("data", (chunk) => {
     const line = buf.slice(0, i).trim();
     buf = buf.slice(i + 1);
     if (!line) continue;
-    pending = pending.then(async () => {
-      try {
-        const msg = JSON.parse(line);
-        const result = await handle(msg);
-        if (msg.id !== undefined) {
-          const response = result === null
-            ? {jsonrpc:'2.0',id:msg.id,error:{code:-32601,message:'Method not found'}}
-            : {jsonrpc:'2.0',id:msg.id,result};
-          process.stdout.write(JSON.stringify(response) + '\n');
-        }
-      } catch (e: any) {
-        process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:null,error:{code:-32700,message:'Parse error'}}) + '\n');
-      }
-    });
+    let msg: any;
+    try { msg = JSON.parse(line); }
+    catch { respond({jsonrpc:'2.0',id:null,error:{code:-32700,message:'Parse error'}}); continue; }
+    // Each request progresses independently, including cancellation notifications.
+    void dispatch(msg).catch(() => respond({jsonrpc:'2.0',id:msg?.id ?? null,error:{code:-32600,message:'Invalid request'}}));
   }
 });
-process.stdin.on("end", () => { pending.then(() => { process.exitCode = 0; }); });
+// EOF is a half-close: one-shot CLI clients still read outstanding responses.
+// Abort bounded waits, but let ordinary in-flight tools finish and flush stdout.
+process.stdin.on('end', () => { for (const id of waitingRequests) pending.get(id)?.abort(); });
+process.stdin.on('close', () => { for (const id of waitingRequests) pending.get(id)?.abort(); });
+process.stdin.on('error', disconnect);
+process.stdout.on('close', disconnect);
+process.stdout.on('error', disconnect);

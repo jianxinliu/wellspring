@@ -82,7 +82,7 @@ wellspring request-cancel req_xxx
 
 Agent 调用 `wellspring_request`，只填写需要什么、用途、交付通道、预期目标和等待期限。用户打开 Web 管理台的「待填写」，核对请求后在独立表单输入值，默认「仅本次任务」，也可选择保存。值直接交给守护进程，不经过聊天；Agent 调用 `wellspring_request_status` 获取状态，只有完成后才返回 `secret://…` 引用。
 
-临时凭据随请求期限到期，后台在后续请求或读取前清理；这不是用一次即焚。等待期间 Agent 应暂停并让用户填写，不要持续轮询。请求状态持久化，守护进程重启后仍可继续。取消、过期或已经完成的请求不能再次填写；保存时目标条目已存在会报错，避免覆盖旧凭据。
+临时凭据随请求期限到期，后台在后续请求或读取前清理；这不是用一次即焚。请求状态持久化，守护进程重启后仍可继续。取消、过期或已经完成的请求不能再次填写；保存时目标条目已存在会报错，避免覆盖旧凭据。
 
 MCP 示例（没有秘密值）：
 
@@ -90,7 +90,9 @@ MCP 示例（没有秘密值）：
 {"name":"wellspring_request","arguments":{"label":"GitHub 发布凭据","purpose":"publish_release","target":"github.com","channel":"A1/exec","ttlMs":900000}}
 ```
 
-完成后用返回的 ref 执行 `wellspring_exec`，同时传入相同的 `purpose` 和 `target`。`wellspring_request_status` 的 `cancel:true` 可取消等待中的请求。当前不会自动唤醒 MCP 宿主里的任务；用户填写后让 Agent 继续检查状态。
+完成后用返回的 ref 执行 `wellspring_exec`，同时传入相同的 `purpose` 和 `target`。`wellspring_request_status` 的 `cancel:true` 可取消待填写请求。传入 `waitMs` 可让这次工具调用等待填写完成，范围 0–55000 毫秒，默认 0；填写、取消或过期后提前返回。等待期间其他 MCP 工具仍可调用，宿主取消调用或断开连接会结束等待。
+
+例如：`{"name":"wellspring_request_status","arguments":{"requestId":"req_xxx","waitMs":55000}}`。超过等待时间仍未填写时返回待处理状态和 `waitTimedOut`，Agent 应把填写链接交给用户并结束等待。只有仍在等待的工具调用会收到完成结果；已经结束的 Agent 回合需要用户继续，当前未接入宿主后台唤醒。
 
 ref 只在查询时才知道，所以 **Agent 必须自己保留 requestId**：`request_status` 按 id 查询，请求记录保留 7 天后清理，此后用该 id 查询会得到 `no such request`。跨任务复用的凭据应在提交时选择「保存供以后使用」并给出名称，之后从 `wellspring_list` 里找条目；「仅本次任务」的值随请求期限到期删除，过期后取不回来，只能重新发起请求。
 
@@ -217,6 +219,16 @@ TTL 控制 Wellspring 的本地分发期限，不会撤销上游服务中的 API
 用 `wellspring keychain store|remove|status` 管理 macOS 钥匙串中的口令（account=`wellspring`，service=`wellspring-master`）；配置后守护进程可在钥匙串已解锁且允许访问时无终端启动。非 macOS 或找不到 `security` 时报告不可用，可改用环境变量或口令文件。调用使用 `spawnSync` 的独立 argv，不经过 shell；`security add-generic-password -w` 要求把口令作为参数，因此仍有短暂的进程参数可见性，不会输出子进程错误内容或将口令写入审计。
 
 v2 将「同 UID 只需复制主密钥和凭据文件即可解密」变为「还需取得口令」。口令文件若仍可被同 UID 读取，或钥匙串访问控制允许同 UID 进程调用 `security` 取出口令，就仍不能隔离恶意同 UID 进程；需结合钥匙串访问控制或独立 OS 用户。请妥善保管口令，丢失后无法恢复封装的主密钥。
+
+## 加密备份与恢复
+
+备份用于人工迁移或离线保存，CLI 提供 `wellspring export <path>` 和 `wellspring import <path>`。直接在终端执行会隐藏输入备份口令，导出时再确认一次。自动化可用 `WELLSPRING_BACKUP_PASSPHRASE_FILE` 指定口令文件，或使用 `WELLSPRING_BACKUP_PASSPHRASE`；口令独立于主密钥口令，不放进命令参数、聊天或 MCP 工具。
+
+导出文件采用 AES-256-GCM，使用独立随机 salt、nonce 和 scrypt（N=32768、r=8、p=1）派生密钥，文件权限为 0600，目标文件已存在时终止。归档保存本地字段的值、标签、配方、有效期和字段使用约束；外部字段只保存来源定义，不读取宿主环境变量、文件或执行来源命令。主密钥、管理员及客户端令牌、请求记录和审计日志均不进入归档。导入另一台机器后，外部来源仍需在目标机器自行配置。
+
+恢复前停止 wellspringd，并确认其 socket 已移除；CLI 遇到现存 socket 会终止，即使它可能是残留文件。恢复期间也应停止其他离线写入命令。导入先校验完整归档及冲突，再用目标库主密钥重新加密，通过一次原子替换落盘。同名条目会使整次导入终止，保留原库，不覆盖任何条目。已过期字段按原时间恢复，身份令牌需重新签发。
+
+归档上限 16 MiB，解密内容上限 8 MiB；口令错误或归档被修改时终止恢复。备份口令丢失后归档中的本地值无法恢复，请独立保管。
 
 ## 构建
 
