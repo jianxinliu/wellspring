@@ -424,6 +424,53 @@ test("vault management validates writes, rotates and deletes with audit", async 
   expect((await rpc({op:'audit'})).events.some((line: string) => JSON.parse(line).op === 'delete')).toBe(true);
 });
 
+test('entry metadata update renames and re-tags without touching values', async () => {
+  const put = (id: string, value: string, tags?: string[]) => rpc({ op: 'put', id, field: 'value', value, mask: 'keep1', tags, token: ADMIN_TOKEN });
+  expect((await put('cred:old_name', 'v1', ['alpha'])).ok).toBe(true);
+  const before = await rpc({ op: 'describe', id: 'cred:old_name' });
+  const fp = before.fields[0].fingerprint;
+  // Nothing to change is an error, not a silent no-op.
+  expect((await rpc({ op: 'update', id: 'cred:old_name', token: ADMIN_TOKEN })).error).toBe('nothing to update');
+  // Metadata changes are admin-only.
+  expect((await rpc({ op: 'update', id: 'cred:old_name', newId: 'cred:sneaky' })).error).toBe('unauthorized');
+  // Invalid and colliding targets are refused.
+  expect((await put('cred:taken', 'x')).ok).toBe(true);
+  expect((await rpc({ op: 'update', id: 'cred:old_name', newId: 'cred:taken', token: ADMIN_TOKEN })).error).toBe('entry already exists: cred:taken');
+  expect((await rpc({ op: 'update', id: 'cred:old_name', newId: 'bad name', token: ADMIN_TOKEN })).error).toBe('invalid id');
+  expect((await rpc({ op: 'update', id: 'cred:missing', tags: ['x'], token: ADMIN_TOKEN })).error).toBe('no such entry: cred:missing');
+  // A real rename keeps the value byte-for-byte and moves the entry.
+  expect(await rpc({ op: 'update', id: 'cred:old_name', newId: 'cred:new_name', tags: ['beta', 'gamma'], token: ADMIN_TOKEN })).toEqual({ ok: true, id: 'cred:new_name' });
+  expect((await rpc({ op: 'describe', id: 'cred:old_name' })).error).toBeDefined();
+  const after = await rpc({ op: 'describe', id: 'cred:new_name' });
+  expect(after.fields[0].fingerprint).toBe(fp);
+  expect(after.tags).toEqual(['beta', 'gamma']);
+  const refs = (await rpc({ op: 'list', token: ADMIN_TOKEN })).descriptors.map((d: any) => d.ref);
+  expect(refs).toContain('secret://cred:new_name');
+  expect(refs).not.toContain('secret://cred:old_name');
+  // Clearing tags removes the field entirely.
+  expect((await rpc({ op: 'update', id: 'cred:new_name', tags: [], token: ADMIN_TOKEN })).ok).toBe(true);
+  expect((await rpc({ op: 'describe', id: 'cred:new_name' })).tags).toEqual([]);
+  expect((await rpc({ op: 'delete', id: 'cred:new_name', token: ADMIN_TOKEN })).ok).toBe(true);
+  expect((await rpc({ op: 'delete', id: 'cred:taken', token: ADMIN_TOKEN })).ok).toBe(true);
+});
+
+test('served console exposes the edit-credential path', async () => {
+  const html = await (await fetch(`http://127.0.0.1:${httpPort}/`)).text();
+  // The edit form and its save path must reach the browser intact (template-literal safe).
+  expect(html).toContain('修改凭据');
+  expect(html).toContain("api('update'");
+  expect(html).toContain('已不在库中');
+  expect(html).toContain('form.dataset.origId');
+  // A rename leaves the id baseline prefilled from the entry, not from a literal.
+  expect(html).not.toMatch(/origId\s*=\s*''/);
+  // Status messages are an overlay, not a block in the page flow (a flow block landed
+  // in the far bottom-left corner, away from the row being acted on).
+  const notice = /\.notice \{[^}]*\}/.exec(html);
+  expect(notice).not.toBeNull();
+  expect(notice![0]).toContain('position:fixed');
+  expect(notice![0]).not.toContain('min-height');
+});
+
 test('CLI template config is valid, private and removed after exit',async()=>{
   const {writeFileSync,existsSync}=await import('node:fs');
   const template=join(DIR,'db.template');

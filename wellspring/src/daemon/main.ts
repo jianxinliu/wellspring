@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync, rmSync, renameSync, chmodSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { listDescriptors, describe, getSecretFresh, putSecret, putSource, adoptSource, deleteSecret, isExpiryError, getMasterKey, getField, setUsePolicy } from "../core/store.ts";
+import { listDescriptors, describe, getSecretFresh, putSecret, putSource, adoptSource, deleteSecret, updateEntry, isExpiryError, getMasterKey, getField, setUsePolicy } from "../core/store.ts";
 import { validateChannel, boundedText, useAllowed, discoverAllowed } from "../policy/access.ts";
 import { cleanupRequests, createRequest, requestStatus, listRequests, fulfillRequest, cancelRequest } from "../core/requests.ts";
 import { totp, hmac, encryptAesGcm, decryptAesGcm } from "../core/derive.ts";
@@ -348,6 +348,24 @@ function dispatch(msg: any): any {
       }
       logDraw({ ...event, verdict: "ok" });
       return { ok: true };
+    }
+    // Metadata-only change: rename the entry and/or replace its tags. Values are
+    // never read or rewritten, so this path holds no plaintext and needs no TTL.
+    case "update": {
+      const event = { ts: Date.now(), op: "update", entry: typeof msg.id === "string" ? msg.id : "<invalid>",
+        field: "*", channel: "admin" };
+      if (burnToken(msg) !== "admin") {
+        logDraw({ ...event, verdict: "denied_auth" });
+        return { error: "unauthorized" };
+      }
+      try {
+        const r = updateEntry(msg.id, { newId: msg.newId, tags: msg.tags });
+        logDraw({ ...event, entry: r.id, verdict: "ok" });
+        return { ok: true, id: r.id };
+      } catch (error) {
+        logDraw({ ...event, verdict: "error" });
+        throw error;
+      }
     }
     case "view": {
       const d = describe(msg.id, visible);

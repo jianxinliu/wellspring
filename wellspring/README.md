@@ -55,7 +55,7 @@ wellspring request-cancel req_xxx
 | src/core/backup.ts | 加密备份归档：导出/导入、整档校验、原子替换 |
 | src/daemon/main.ts | wellspringd：unix socket JSON-RPC、token 鉴权、限速、审计 JSONL |
 | src/daemon/web.ts | Web 管理台：凭据库 / 待填写 / 使用记录 / 概览 / 设置（127.0.0.1） |
-| src/cli/main.ts | CLI：put/list/describe/view/resolve/policy/audit/exec/derive/request/export/import/seal |
+| src/cli/main.ts | CLI：put/rename/tag/list/describe/view/resolve/policy/audit/exec/derive/request/export/import/seal |
 | src/mcp/server.ts | MCP stdio server：6 工具，默认抑制执行输出，可选择精确值脱敏 |
 | test/e2e.test.ts | 端到端回归测试（bun test） |
 
@@ -104,6 +104,12 @@ Web 凭据字段的「使用范围」可限制调用者、通道、用途、目�
 调用者由宿主提供的令牌确定，不相信 Agent 参数里的身份。人类管理员身份是 `admin`，也受字段范围检查。宿主可用 `wellspring client-issue release-agent` 签发独立令牌，然后通过受保护的宿主环境 `WELLSPRING_CLIENT_TOKEN` 注入 CLI/MCP；不要把令牌放入对话。没有配置时保持读取 admin token 的兼容行为，因此按 Agent 隔离需要宿主明确配置独立令牌。相同调用者名称表示同一权限主体。
 
 **用途和目标是调用方声明的意图，只做精确策略匹配，不核验网络流量或实际进程目的地。** 有权修改接收程序、读取同 UID 文件或操作宿主配置的 Agent 仍可能接触秘密；要获得更强隔离，应配合可信执行器和独立 OS 权限边界。
+
+## 修改与改名
+
+Web 凭据库每行的「修改」可在同一个表单里改名称、标签、值、类型、脱敏方式和有效期：值留空表示不动，只改名称或标签时不会重新加密数据，改名前后字段指纹不变。改名会拒绝和已有条目重名，`person:` / `cred:` 前缀决定条目类型。命令行等价操作是 `wellspring rename <id> <new-id>` 与 `wellspring tag <id> --set a,b`（`--set ''` 清空）；这些元数据改动只写元数据，不读取任何值，且需要 admin token。
+
+审计和统计按**当时**的名字记录历史取用次数。改名或删除后，旧名字仍会出现在「概览」的条形图里，并标注「已不在库中」——这样计数不会被静默改写，也看得出哪些历史名字对应的是已删条目。
 
 ## 外部来源（值不存进来）
 

@@ -11,7 +11,7 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const READ_OPS = new Set(["ping", "list", "describe", "view", "policy_get", "audit", "auth_check", "request_list"]);
 const WRITE_OPS = new Set(["put", "put_source", "adopt", "delete", "policy_put", "resolve", "draw_env", "draw", "auth_issue_oneshot",
   // Derived operations need the admin token too: a signature oracle is still an oracle.
-  "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt", "request_fulfill", "request_cancel", "access_put"]);
+  "derive_totp", "derive_hmac", "derive_encrypt", "derive_decrypt", "request_fulfill", "request_cancel", "access_put", "update"]);
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -155,11 +155,16 @@ const HTML = `<!doctype html>
   .b-cred { background:rgba(79,195,247,.12); color:var(--accent); }
   .b-pii { background:rgba(255,167,38,.12); color:var(--orange); }
   .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--dim); }
+  .ellipsis { display:inline-block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:middle; }
   button { background:var(--card); color:var(--fg); border:1px solid var(--line); padding:7px 12px; border-radius:8px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
   button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .danger { color:var(--red); }
-  .notice { padding:10px; color:var(--green); min-height:40px; }
+  /* A status toast: it must not sit in the page flow (that put it in the far
+     bottom-left corner, far from the row the operator just acted on). */
+  .notice { position:fixed; left:50%; bottom:28px; transform:translate(-50%,10px); z-index:50; max-width:min(88vw,540px); padding:10px 16px; border-radius:10px; background:#22303d; border:1px solid var(--line); color:var(--green); box-shadow:0 10px 28px rgba(0,0,0,.45); opacity:0; pointer-events:none; transition:opacity .18s ease, transform .18s ease; }
+  .notice.show { opacity:1; transform:translate(-50%,0); }
+  .notice[data-failed="1"] { color:var(--red); border-color:rgba(239,83,80,.45); }
   .table-wrap { overflow-x:auto; }
   @media(max-width:640px) { header { flex-wrap:wrap; padding:12px; } nav { flex-wrap:wrap; margin:0; } main { padding:12px; } .kv { grid-template-columns:1fr; } }
   input,select,textarea { background:var(--bg); border:1px solid var(--line); color:var(--fg); padding:6px 10px; border-radius:8px; font-size:13px; }
@@ -228,10 +233,20 @@ async function api(op, body = {}) {
   if (!r.ok || result.error) throw new Error(result.error || '请求失败');
   return result;
 }
+let noticeTimer = 0;
 function notify(message, failed = false) {
   let el = document.getElementById('notice');
-  if (!el) { el = document.createElement('div'); el.id='notice'; el.className='notice'; el.setAttribute('role','status'); document.body.appendChild(el); }
-  el.textContent = message; el.style.color = failed ? 'var(--red)' : 'var(--green)';
+  if (!el) {
+    el = document.createElement('div'); el.id='notice'; el.className='notice';
+    el.setAttribute('role','status'); el.setAttribute('aria-live','polite');
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.dataset.failed = failed ? '1' : '0';
+  el.classList.add('show');
+  // Errors stay long enough to read; successes get out of the way.
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => el.classList.remove('show'), failed ? 5000 : 2600);
 }
 window.addEventListener('unhandledrejection', e => { e.preventDefault(); notify(e.reason?.message ?? '没有完成，原因未知', true); });
 
@@ -475,7 +490,7 @@ function drawVault() {
           : esc(e.maskedPreview?.[f.name] ?? "****")) + "</td>" +
         "<td>" + expiryBadge(f) + "</td>" +
         (i === 0 ? '<td rowspan="' + e.fields.length + '">' + (e.tags ?? []).map(esc).join(", ") + "</td>" : "") +
-        '<td><button class="usage-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '" aria-expanded="false">使用</button> <button class="access-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">使用范围</button> <button class="edit-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">轮换</button> <button class="danger delete-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">删除字段</button>' + (i === 0 ? ' <button class="danger delete-entry" data-entry="' + S.entries.indexOf(e) + '">删除条目</button>' : '') + '</td></tr>'
+        '<td><button class="usage-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '" aria-expanded="false">使用</button> <button class="access-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">使用范围</button> <button class="edit-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">修改</button> <button class="danger delete-field" data-entry="' + S.entries.indexOf(e) + '" data-field="' + i + '">删除字段</button>' + (i === 0 ? ' <button class="danger delete-entry" data-entry="' + S.entries.indexOf(e) + '">删除条目</button>' : '') + '</td></tr>'
       ).join("");
     }).join("") + "</table>";
   el.className = 'table-wrap';
@@ -554,16 +569,18 @@ function showAdd(index, fieldIndex) {
   // can be changed under 高级选项. Rotation keeps the stricter checked fields.
   app.insertAdjacentHTML("afterbegin",
     entry
-      ? '<div class="card" id="add-form"><h2>轮换字段</h2><p class="hint">旧值不会被读取，直接用新值覆盖。</p>' +
-        '<div class="kv"><b>条目</b><span class="mono">' + esc(entry.id) + '</span>' +
+      ? '<div class="card" id="add-form"><h2>修改凭据</h2><p class="hint">留空的项保持不变。改名只换标识，不会重新加密已存的值。有效期随新值一起保存，不改值就不生效。</p>' +
+        '<div class="kv"><b>名称</b><input id="f-id" autocapitalize="off" autocorrect="off" spellcheck="false">' +
         '<b>字段名</b><span class="mono">' + esc(field.name) + '</span>' +
-        '<b>新值</b><input id="f-val" type="password" placeholder="新的值" autocomplete="new-password">' +
+        '<b>新值</b><input id="f-val" type="password" placeholder="留空表示不改值" autocomplete="new-password">' +
         '<b>类型</b><select id="f-cls"><option value="credential">凭据</option><option value="pii">个人信息</option><option value="pii_high">高敏感个人信息</option></select>' +
         '<b>脱敏</b><select id="f-mask"><option value="keep1">keep1 (****)</option><option value="phone">phone</option><option value="region">region</option><option value="none">none</option></select>' +
         '<b></b><span id="f-mask-note"></span>' +
         '<b>有效期</b><select id="f-ttl"><option value="">保持当前</option><option value="3600000">1 小时</option><option value="86400000">1 天</option><option value="604800000">7 天</option><option value="2592000000">30 天</option></select>' +
-        '<b></b><span id="f-ttl-note"></span></div>' +
-        '<div class="row" style="margin-top:12px"><button onclick="addPut()">存新值</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>'
+        '<b></b><span id="f-ttl-note"></span>' +
+        '<b>标签</b><input id="f-tags" placeholder="逗号分隔；留空则清空">' +
+        '</div>' +
+        '<div class="row" style="margin-top:12px"><button onclick="addPut()">保存修改</button><button onclick="document.getElementById(\\'add-form\\').remove()">取消</button></div></div>'
       : '<div class="card" id="add-form"><h2>新增凭据</h2><p class="hint">填个名字、粘贴值，保存。</p>' +
         '<div class="row" id="quick-kinds"></div>' +
         '<div class="kv"><b>名称</b><input id="f-id" placeholder="例如 github_token" autocapitalize="off" autocorrect="off">' +
@@ -593,8 +610,10 @@ function showAdd(index, fieldIndex) {
     form.dataset.edit = '1';
     form.dataset.entry = String(index);
     form.dataset.field = field.name;
-    // Tags are entry-wide and never edited during a field rotation.
-    form.dataset.tags = JSON.stringify(entry.tags ?? []);
+    // The original id is the rename baseline; the name field starts at it.
+    form.dataset.origId = entry.id;
+    document.getElementById('f-id').value = entry.id;
+    document.getElementById('f-tags').value = (entry.tags ?? []).join(', ');
     document.getElementById('f-cls').value = field.class;
     const select = document.getElementById('f-mask');
     if (typeof field.mask === 'string') {
@@ -603,7 +622,7 @@ function showAdd(index, fieldIndex) {
       document.getElementById('f-mask-note').textContent = '已保留原脱敏方式。';
     } else {
       select.add(new Option('请选择脱敏方式', ''), 0); select.value = '';
-      document.getElementById('f-mask-note').textContent = '请明确选择轮换后的脱敏方式。';
+      document.getElementById('f-mask-note').textContent = '请明确选择修改后的脱敏方式。';
     }
     // Rotation must not silently wipe an existing expiry: keep the current window
     // unless the operator picks a new duration.
@@ -616,7 +635,7 @@ function showAdd(index, fieldIndex) {
       ttlSelect.dataset.expiresAt = String(field.expiresAt);
       ttlNote.textContent = '当前到期时间：' + fmtTs(field.expiresAt) + '。选择具体时长则从现在重新计时。';
     } else {
-      ttlNote.textContent = '该字段当前无有效期。不选择则轮换后仍为永久有效。';
+      ttlNote.textContent = '该字段当前无有效期。不选择则修改后仍为永久有效。';
     }
   }
   document.getElementById('f-val').focus();
@@ -646,34 +665,72 @@ async function addPut() {
   const editing = form.dataset.edit === '1';
   const entry = editing ? S.entries[Number(form.dataset.entry)] : undefined;
   const value = document.getElementById("f-val").value;
-  const source = (document.getElementById("f-src").value || '').trim();
+  const source = (document.getElementById("f-src")?.value || '').trim();
+  const cls = document.getElementById('f-cls').value || undefined;
+  const mask = document.getElementById('f-mask').value;
+  const rawName = document.getElementById("f-id").value;
+  const tags = document.getElementById('f-tags').value.split(',').map(s => s.trim()).filter(Boolean);
+  const ttlSelect = document.getElementById('f-ttl');
+  const ttl = ttlSelect.value;
+  const applyTtl = (body) => {
+    if (ttl === 'keep') body.expiresAt = Number(ttlSelect.dataset.expiresAt);
+    else if (ttl) body.ttlMs = Number(ttl);
+    return body;
+  };
+  if (editing) {
+    // Same normalization as creation; a name that already carries its prefix keeps it.
+    const newId = normalizeId(rawName, cls);
+    if (!newId) { notify('请填写名称', true); return; }
+    if (ttl === 'choose') { notify('请选择新的有效期', true); return; }
+    if (value && !mask) { notify('请明确选择脱敏方式后保存', true); return; }
+    const renamed = newId !== form.dataset.origId;
+    const tagsChanged = JSON.stringify(tags) !== JSON.stringify(entry.tags ?? []);
+    if (!value && !renamed && !tagsChanged) { notify('没有改动', true); return; }
+    const submit = form.querySelector('button'); if (submit) submit.disabled = true;
+    if (value) {
+      // Rotation replaces the ciphertext without ever reading the old one.
+      try {
+        const w = await api('put', applyTtl({ id: form.dataset.origId, field: form.dataset.field, value, cls, mask }));
+        if (!w.ok) throw new Error('put failed');
+      } catch {
+        notify('新值没有保存成功，请检查内容后重试', true);
+        if (submit) submit.disabled = false;
+        return;
+      }
+    }
+    if (renamed || tagsChanged) {
+      try {
+        const u = await api('update', { id: form.dataset.origId, newId: renamed ? newId : undefined, tags });
+        if (!u.ok) throw new Error('update failed');
+      } catch {
+        // The value (if any) is already stored; say so instead of implying nothing happened.
+        notify(value ? '新值已保存，但名称或标签没改成，请重试' : '名称或标签没改成，请检查后重试', true);
+        if (submit) submit.disabled = false;
+        return;
+      }
+    }
+    notify(value ? '已保存修改并加密新值' : renamed ? '已改名，值未改动' : '已更新标签');
+    form.remove(); renderVault();
+    return;
+  }
   if (!value && !source) { notify('填一个值，或者填一个来源', true); return; }
   if (value && source) { notify('值和来源只能选一个', true); return; }
   const body = {
     // A bare name is prefixed so nobody has to learn the ref syntax up front.
-    id: editing ? entry.id : normalizeId(document.getElementById("f-id").value, document.getElementById('f-cls').value),
-    field: editing ? form.dataset.field : (document.getElementById("f-field").value || "value"),
-    value, cls: document.getElementById("f-cls").value || undefined,
-    mask: document.getElementById("f-mask").value,
-    tags: form.dataset.tags !== undefined
-      ? JSON.parse(form.dataset.tags)
-      : document.getElementById('f-tags').value.split(',').map(s => s.trim()).filter(Boolean),
+    id: normalizeId(rawName, cls),
+    field: document.getElementById("f-field").value || "value",
+    value, cls, mask, tags,
   };
   if (!body.id) { notify('请填写名称', true); return; }
-  const ttlSelect = document.getElementById('f-ttl');
-  const ttl = ttlSelect.value;
-  if (ttl === 'choose') { notify('请选择轮换后的有效期', true); return; }
-  if (ttl === 'keep') body.expiresAt = Number(ttlSelect.dataset.expiresAt);
-  else if (ttl) body.ttlMs = Number(ttl);
+  applyTtl(body);
   if (!body.mask) { notify('请明确选择脱敏方式后保存', true); return; }
   // A source-backed field stores no ciphertext, so it takes the other write path:
   // put() would demand a value, and there is none to give.
-  const r = source && !editing
+  const r = source
     ? await api("put_source", { ...body, source, value: undefined })
     : await api("put", body);
   if (r.ok) {
-    if (editing) notify('已轮换并加密保存');
-    else if (source) notify('已绑定来源 ' + source + '，不存值');
+    if (source) notify('已绑定来源 ' + source + '，不存值');
     else notify('已保存 ' + body.id + (body.ttlMs ? '（' + fmtDuration(body.ttlMs) + '）' : ''));
     form.remove(); renderVault();
   }
@@ -726,7 +783,8 @@ function drawAudit() {
 async function renderStats() {
   const app = document.getElementById("app");
   const [audit, vault] = await Promise.all([api('audit'), api('list')]);
-  S.entries = vault.descriptors ?? [];
+  S.entries = (vault.descriptors ?? []).map(e => ({ ...e, id: e.ref.slice('secret://'.length) }));
+  const known = new Set(S.entries.map(e => e.id));
   const evs = parseAudit(audit.events);
   S.events = evs;
   const draws = evs.filter(e => ['draw', 'draw_env', 'resolve'].includes(e.op));
@@ -751,8 +809,8 @@ async function renderStats() {
     '<div class="stat"><div class="num" style="color:var(--violet)">' + expired.length + '</div><div class="lbl">已过期</div></div>' +
     '<div class="stat"><div class="num">' + S.entries.length + '</div><div class="lbl">条目数</div></div>' +
     '</div>' +
-    '<div class="card"><h2>各条目被取用次数</h2>' + top(byEntry).map(([k, v]) =>
-      '<div style="margin:6px 0"><div class="row" style="margin:0"><span class="mono" style="width:200px">' + esc(k) + '</span><span class="mono">' + v + '</span></div><div class="bar"><div style="width:' + (v / max * 100) + '%"></div></div></div>').join("") + '</div>' +
+    '<div class="card"><h2>各条目被取用次数</h2><p class="hint">历史记录按当时的名字统计；已改名或删除的条目仍会留在这里，标注为「已不在库中」。</p>' + top(byEntry).map(([k, v]) =>
+      '<div style="margin:6px 0"><div class="row" style="margin:0"><span class="mono ellipsis" style="width:240px" title="' + esc(k) + '">' + esc(k) + '</span>' + (known.has(k) ? '' : '<span class="badge b-expired">已不在库中</span>') + '<span class="mono">' + v + '</span></div><div class="bar"><div style="width:' + (v / max * 100) + '%"></div></div></div>').join("") + '</div>' +
     '<div class="card"><h2>各操作次数</h2><div class="kv">' + Object.entries(byOp).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
     '<div class="card"><h2>各取用方式次数</h2><div class="kv">' + Object.entries(byChannel).map(([k, v]) => "<b>" + esc(k) + "</b><span>" + v + "</span>").join("") + '</div></div>' +
     '<div class="card"><h2>当前设置</h2><div class="kv"><b>允许的解析原因</b><span>' + (p.policy?.resolveReasons ?? []).map(esc).join(", ") + '</span><b>限速</b><span>' + esc(p.policy?.resolveRatePerMin ?? "-") + ' 次/分钟（每个字段）</span></div></div>';

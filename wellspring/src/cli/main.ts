@@ -360,7 +360,7 @@ async function main() {
     }
     case "--help":
     case "help":
-      console.log("usage: wellspring <put|adopt|delete|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|export|import|seal|unseal|keychain> ...\n  put ... --from <src>  Reference an external source instead of storing a copy\n  adopt      Copy an external source value into the vault\n  exec --purpose <reason> [--target <target>] -- <cmd>  Declared intent for every draw in this exec\n  derive <op> <ref> [--purpose <reason>] [--target <target>]\n  client-issue <caller>  Admin: mint a scoped bearer (printed on stdout)\n  request <label> --purpose <reason> --channel <channel> [--target <target>] [--ttl 15m]\n  request-status <requestId> / request-cancel <requestId>\n  export <path> / import <path>  Human offline encrypted backup; source definitions only\n    Hidden TTY or WELLSPRING_BACKUP_PASSPHRASE[_FILE]; import requires stopped daemon\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
+      console.log("usage: wellspring <put|adopt|delete|rename|tag|list|describe|view|resolve|policy|audit|exec|derive|askpass|client-issue|request|request-status|request-cancel|export|import|seal|unseal|keychain> ...\n  put ... --from <src>  Reference an external source instead of storing a copy\n  adopt      Copy an external source value into the vault\n  rename <id> <new-id>  Rename an entry; stored values are kept as they are\n  tag <id> --set a,b  Replace an entry's tags (--set '' clears)\n  exec --purpose <reason> [--target <target>] -- <cmd>  Declared intent for every draw in this exec\n  derive <op> <ref> [--purpose <reason>] [--target <target>]\n  client-issue <caller>  Admin: mint a scoped bearer (printed on stdout)\n  request <label> --purpose <reason> --channel <channel> [--target <target>] [--ttl 15m]\n  request-status <requestId> / request-cancel <requestId>\n  export <path> / import <path>  Human offline encrypted backup; source definitions only\n    Hidden TTY or WELLSPRING_BACKUP_PASSPHRASE[_FILE]; import requires stopped daemon\n  seal       Wrap the file master key with a passphrase (v2)\n  unseal     Restore same-UID-readable raw master key (v1)\n  keychain store|remove|status  Manage the macOS master passphrase");
       break;
     case "put": {
       const ttlRaw = flag("ttl");
@@ -403,6 +403,28 @@ async function main() {
       const token = adminToken();
       if (!token) throw new Error("delete requires admin authentication");
       const r = await rpc({ op: "delete", id, field, token });
+      console.log(JSON.stringify(r));
+      break;
+    }
+    // Rename keeps the stored values as they are; only the id changes.
+    case "rename": {
+      const [id, newId] = rest;
+      if (!id || !newId || rest.length > 2 || rest.some((value) => value.startsWith("-"))) throw new Error("usage: rename <id> <new-id>");
+      const token = adminToken();
+      if (!token) throw new Error("rename requires admin authentication");
+      const r = await rpc({ op: "update", id, newId, token });
+      console.log(JSON.stringify(r));
+      break;
+    }
+    // Replace an entry's tags wholesale: `tag <id> --set a,b`, or --set '' to clear.
+    case "tag": {
+      const [id] = rest;
+      const set = flag("set");
+      if (!id || set === undefined) throw new Error("usage: tag <id> --set a,b  (--set '' clears)");
+      const token = adminToken();
+      if (!token) throw new Error("tag requires admin authentication");
+      const tags = set.split(",").map((s) => s.trim()).filter(Boolean);
+      const r = await rpc({ op: "update", id, tags, token });
       console.log(JSON.stringify(r));
       break;
     }

@@ -162,6 +162,13 @@ function validateKey(value: unknown, name: "id" | "field"): asserts value is str
   }
 }
 
+function assertTags(tags: unknown): asserts tags is string[] {
+  if (!Array.isArray(tags) || tags.length > 100 ||
+    Array.from(tags).some((tag) => typeof tag !== "string" || !tag.trim() || tag.length > 128 || /[\u0000-\u001f\u007f]/u.test(tag))) {
+    throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
+  }
+}
+
 export const MIN_TTL_MS = 1000;                 // 1 second
 export const MAX_TTL_MS = 31_536_000_000;       // 1 year (365 days)
 /** True when the field carries an expiry that has already elapsed. Never reads plaintext. */
@@ -225,10 +232,7 @@ export function putSecret(id: string, field: string, plaintext: string, opts?: {
   if (opts !== undefined && (opts === null || typeof opts !== "object" || Array.isArray(opts))) throw new Error("invalid options");
   if (opts?.cls !== undefined && !["credential", "pii", "pii_high"].includes(opts.cls)) throw new Error("invalid class");
   if (opts?.mask !== undefined && !["keep1", "phone", "region", "none"].includes(opts.mask)) throw new Error("invalid mask");
-  if (opts?.tags !== undefined && (!Array.isArray(opts.tags) || opts.tags.length > 100 ||
-    Array.from(opts.tags).some((tag) => typeof tag !== "string" || !tag.trim() || tag.length > 128 || /[\u0000-\u001f\u007f]/u.test(tag)))) {
-    throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
-  }
+  if (opts?.tags !== undefined) assertTags(opts.tags);
   const usePolicy = opts?.usePolicy === undefined ? undefined : validateUsePolicy(opts.usePolicy);
   const expiresAt = resolveExpiry(opts);
   const s = loadStore();
@@ -258,10 +262,7 @@ export function putSource(id: string, field: string, spec: unknown, opts?: { cls
   if (opts !== undefined && (opts === null || typeof opts !== "object" || Array.isArray(opts))) throw new Error("invalid options");
   if (opts?.cls !== undefined && !["credential", "pii", "pii_high"].includes(opts.cls)) throw new Error("invalid class");
   if (opts?.mask !== undefined && !["keep1", "phone", "region", "none"].includes(opts.mask)) throw new Error("invalid mask");
-  if (opts?.tags !== undefined && (!Array.isArray(opts.tags) || opts.tags.length > 100 ||
-    Array.from(opts.tags).some((tag) => typeof tag !== "string" || !tag.trim() || tag.length > 128 || /[\u0000-\u001f\u007f]/u.test(tag)))) {
-    throw new Error("invalid tags: expected at most 100 nonempty strings of at most 128 characters");
-  }
+  if (opts?.tags !== undefined) assertTags(opts.tags);
   const usePolicy = opts?.usePolicy === undefined ? undefined : validateUsePolicy(opts.usePolicy);
   const expiresAt = resolveExpiry(opts);
   // Fail fast: a reference that cannot be read on day one is almost always a
@@ -308,6 +309,43 @@ export function deleteSecret(id: string, field?: string): void {
     if (Object.keys(entry.fields).length === 0) delete s.entries[id];
   }
   saveStore(s);
+}
+
+export type EntryChange = { newId?: string; tags?: string[] };
+
+/**
+ * Change entry-level metadata without reading or rewriting any field value:
+ * rename the entry and/or replace its tags. A rename keeps the entry's position
+ * in the store (listings stay stable) and refuses to overwrite an existing id.
+ */
+export function updateEntry(id: string, change: EntryChange): { id: string } {
+  validateKey(id, "id");
+  if (!change || typeof change !== "object" || Array.isArray(change)) throw new Error("invalid change");
+  if (change.newId !== undefined) validateKey(change.newId, "id");
+  if (change.tags !== undefined) assertTags(change.tags);
+  if (change.newId === undefined && change.tags === undefined) throw new Error("nothing to update");
+  const s = loadStore();
+  if (!hasOwn(s.entries, id)) throw new Error(`no such entry: ${id}`);
+  const newId = change.newId;
+  if (newId !== undefined && newId !== id && hasOwn(s.entries, newId)) throw new Error(`entry already exists: ${newId}`);
+  const entry = s.entries[id];
+  if (change.tags !== undefined) {
+    if (change.tags.length) entry.tags = change.tags;
+    else delete entry.tags;
+  }
+  if (newId !== undefined && newId !== id) {
+    // The prefix decides the entry type, the same rule used at creation time.
+    const type = newId.startsWith("person:") ? "person" : newId.startsWith("cred:") ? "credential" : entry.type;
+    const renamed: Entry = { ...entry, id: newId, type };
+    const entries: Record<string, Entry> = {};
+    for (const [key, value] of Object.entries(s.entries)) {
+      if (key === id) entries[newId] = renamed;
+      else entries[key] = value;
+    }
+    s.entries = entries;
+  }
+  saveStore(s);
+  return { id: newId ?? id };
 }
 
 export function getSecret(id: string, field: string): string {
