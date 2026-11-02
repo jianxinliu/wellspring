@@ -627,7 +627,10 @@ function normalizeId(raw, cls) {
   const prefix = cls === "pii" || cls === "pii_high" ? "person:" : "cred:";
   const typed = /^(cred|person):/i.test(name) ? name : prefix + name;
   // Separators a human would type are not allowed in refs; normalize instead of rejecting.
-  return typed.replace(/\./g, "_").replace(/\s+/g, "_");
+  // NOTE: this code is a template literal, so backslashes are doubled on purpose. With a
+  // single backslash the browser would receive a bare dot (matches every char) and a bare
+  // letter s, turning any name into a run of underscores.
+  return typed.replace(/[.]/g, "_").replace(/[\\s]+/g, "_");
 }
 // Pre-fills the form from a quick kind: name, field, class, mask, and its own tags.
 function applyQuick(i) {

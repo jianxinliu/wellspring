@@ -387,6 +387,25 @@ test("Web UI HTTP API: auth, vault ops, audit", async () => {
   expect(evs.length).toBeGreaterThan(0);
 });
 
+// The console's form turns a typed name into a ref. That JS ships inside a template
+// literal in web.ts, so a single backslash there reaches the browser as a bare
+// metacharacter: `.` then matches EVERY character and every name becomes a run of
+// underscores, which renders as a blank blue pill and an underline-thin save notice.
+// Assert on the SERVED page and its behaviour, not on the TypeScript source text —
+// the source reads correctly either way, so a source-level assertion cannot catch this.
+test("served console normalizes a typed name into a usable ref", async () => {
+  const html = await (await fetch(`http://127.0.0.1:${httpPort}/`)).text();
+  const m = /function normalizeId\(raw, cls\) \{[\s\S]*?\n\}/.exec(html);
+  expect(m).not.toBeNull();
+  const normalizeId = new Function(`${m![0]}; return normalizeId;`)() as (raw: string, cls: string) => string;
+  expect(normalizeId("deepseek_api_key", "credential")).toBe("cred:deepseek_api_key");
+  expect(normalizeId("deepseek.api key", "credential")).toBe("cred:deepseek_api_key");
+  expect(normalizeId("person:zhang.san", "pii")).toBe("person:zhang_san");
+  expect(normalizeId("  ", "credential")).toBe("");
+  // The regression itself: no name may collapse into a run of underscores.
+  expect(normalizeId("deepseek_api_key", "credential")).not.toMatch(/_{3,}/);
+});
+
 test("vault management validates writes, rotates and deletes with audit", async () => {
   const put = (id: string, field: string, value: string) => rpc({op:'put',id,field,value,token:ADMIN_TOKEN});
   expect((await put('__proto__','value','bad')).error).toBeDefined();
